@@ -143,7 +143,15 @@ def main():
                     _, _, github_service = init_services()
                     repo_info = github_service.analyze_repository(repo_url)
                     st.session_state.current_repo = repo_info
-                    st.success("Repository analyzed successfully!")
+                    
+                    # Enhanced success message
+                    st.success(f"""
+        Repository analyzed successfully!
+        - Name: {repo_info['name']}
+        - Language: {repo_info['language']}
+        - Files in root: {repo_info['files_count']}
+        - Last updated: {repo_info['last_updated']}
+                    """)
                 except Exception as e:
                     st.error(f"Error analyzing repository: {str(e)}")
         
