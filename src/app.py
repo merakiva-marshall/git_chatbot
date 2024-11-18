@@ -148,10 +148,24 @@ def main():
                     st.success(f"""
         Repository analyzed successfully!
         - Name: {repo_info['name']}
-        - Language: {repo_info['language']}
-        - Files in root: {repo_info['files_count']}
-        - Last updated: {repo_info['last_updated']}
+        - Language: {repo_info.get('language', 'Not specified')}
+        - Files in root: {repo_info.get('root_files', 0)}
+        - Total files: {repo_info.get('total_files', 0)}
+        - Directories: {len(repo_info.get('directories', []))}
+        - Last updated: {repo_info.get('last_updated', 'Unknown')}
                     """)
+                    
+                    # Show additional info in expandable section
+                    with st.expander("View Detailed Analysis"):
+                        st.write("File Types:")
+                        for ext, count in repo_info.get('file_types', {}).items():
+                            st.write(f"- {ext}: {count} files")
+                        
+                        if repo_info.get('dependencies', {}).get('package_json'):
+                            st.write("📦 Found package.json (Node.js/JavaScript project)")
+                        if repo_info.get('dependencies', {}).get('requirements_txt'):
+                            st.write("📦 Found requirements.txt (Python project)")
+                            
                 except Exception as e:
                     st.error(f"Error analyzing repository: {str(e)}")
         
