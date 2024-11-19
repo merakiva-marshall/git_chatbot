@@ -5,19 +5,22 @@ import logging
 from pathlib import Path
 import os
 import re
+from vector_store.embeddings_manager import EmbeddingsManager
 
 class GitHubService:
-    def __init__(self, github_token: str):
+    def __init__(self, github_token: str, embeddings_manager: Optional[EmbeddingsManager] = None):
         self.client = Github(github_token)
+        self.embeddings_manager = embeddings_manager
         self._setup_logging()
         
     def _setup_logging(self):
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-    def analyze_repository(self, repo_url: str) -> Dict:
+    async def analyze_repository(self, repo_url: str) -> Dict:
         """Analyze a GitHub repository comprehensively"""
         self.logger.info(f"Starting analysis of repository: {repo_url}")
+               
         
         try:
             # Extract repository name from URL
@@ -58,10 +61,31 @@ class GitHubService:
                 repo_info.update(structure_info)
             except Exception as e:
                 self.logger.warning(f"Error analyzing structure: {str(e)}")
-            # Code relationship analysis
+
+            # Process files for embeddings if manager is available
+            if self.embeddings_manager and structure_info.get('code_files'):
+                files_content = []
+                for file_info in structure_info.get('code_files', []):
+                    try:
+                        content = self.get_file_content(repo.full_name, file_info['path'])
+                        if content:
+                            files_content.append({
+                                'path': file_info['path'],
+                                'content': content,
+                                'last_modified': file_info.get('last_modified')
+                            })
+                    except Exception as e:
+                        self.logger.warning(f"Error getting content for {file_info['path']}: {str(e)}")
+
+                # Process files and generate embeddings
+                if files_content:
+                    await self.embeddings_manager.process_repository(repo_url, files_content)
+
+            # Add code relationships
             if structure_info.get('code_files'):
                 code_relationships = self._analyze_code_relationships(repo, structure_info['code_files'])
                 repo_info['code_relationships'] = code_relationships
+
             # Try to get dependency info
             try:
                 dependencies = self._analyze_dependencies(repo)
@@ -85,7 +109,7 @@ class GitHubService:
             raise Exception(f"Error analyzing repository: {str(e)}")
 
     def _analyze_repository_structure(self, repo) -> Dict:
-        """Analyze the repository's file structure"""
+        """Analyze the repository's file structure with debugging"""
         structure = {
             'file_types': {},
             'directories': [],
@@ -95,6 +119,9 @@ class GitHubService:
         
         def process_contents(path: str = ''):
             try:
+                # Debug log
+                self.logger.info(f"Processing path: {path}")
+                
                 contents = repo.get_contents(path)
                 if not isinstance(contents, list):
                     contents = [contents]
@@ -103,6 +130,8 @@ class GitHubService:
                     try:
                         if item.type == 'dir':
                             structure['directories'].append(item.path)
+                            # Debug log
+                            self.logger.info(f"Found directory: {item.path}")
                             process_contents(item.path)
                         else:
                             structure['total_files'] += 1
@@ -110,6 +139,8 @@ class GitHubService:
                             structure['file_types'][ext] = structure['file_types'].get(ext, 0) + 1
                             
                             if self._is_code_file(item.path):
+                                # Debug log
+                                self.logger.info(f"Found code file: {item.path}")
                                 structure['code_files'].append({
                                     'path': item.path,
                                     'size': item.size,
@@ -121,6 +152,13 @@ class GitHubService:
                 self.logger.warning(f"Error accessing path {path}: {str(e)}")
 
         process_contents()
+        
+        # Debug summary
+        self.logger.info(f"Analysis complete. Found:")
+        self.logger.info(f"- {len(structure['directories'])} directories")
+        self.logger.info(f"- {structure['total_files']} total files")
+        self.logger.info(f"- {len(structure['code_files'])} code files")
+        
         return structure
 
     def _analyze_dependencies(self, repo) -> Dict:

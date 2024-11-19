@@ -6,28 +6,42 @@ from config import AppConfig
 from chat_service import ChatService
 from github_service import GitHubService
 from utils.settings_manager import SettingsManager
+import asyncio
+from vector_store.embeddings_manager import EmbeddingsManager
 
 # Load environment variables
 load_dotenv()
 
 # Available Claude models
 CLAUDE_MODELS = {
-    "Claude 3 Opus": "claude-3-opus-20240229",
     "Claude 3 Sonnet": "claude-3-sonnet-20240229",
     "Claude 3 Haiku": "claude-3-haiku-20240307",
 }
+
+def analyze_repository_async(github_service: GitHubService, repo_url: str):
+    """Run async repository analysis"""
+    return asyncio.run(github_service.analyze_repository(repo_url))
 
 def init_services():
     """Initialize all required services"""
     config = AppConfig()
     anthropic_client = Anthropic(api_key=config.anthropic_api_key)
+    
+    # Initialize embeddings manager
+    embeddings_manager = EmbeddingsManager(anthropic_client)
+    
     selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3 Sonnet"])
+    custom_instructions = st.session_state.get('custom_instructions', '')
+    
+    # Initialize services with embeddings manager
     chat_service = ChatService(
-        anthropic_client, 
+        anthropic_client,
+        embeddings_manager=embeddings_manager,
         model=selected_model,
-        custom_instructions=st.session_state.get('custom_instructions', '')
+        custom_instructions=custom_instructions
     )
-    github_service = GitHubService(config.github_token)
+    github_service = GitHubService(config.github_token, embeddings_manager=embeddings_manager)
+    
     return config, chat_service, github_service
 
 def init_session_state(settings_manager: SettingsManager):
@@ -44,34 +58,47 @@ def init_session_state(settings_manager: SettingsManager):
         st.session_state.custom_instructions = settings.get('custom_instructions', '')
     if "last_repo" not in st.session_state:
         st.session_state.last_repo = settings.get('last_repo', '')
-    if "waiting_for_response" not in st.session_state:
-        st.session_state.waiting_for_response = False
 
 def handle_chat_input(prompt: str, chat_service: ChatService):
-    """Handle chat input and update messages"""
+    """Handle chat input with full debugging"""
     if not prompt.strip():
         return
     
-    # Display user message immediately
+    with st.sidebar.expander("🤖 Chat Debug", expanded=True):
+        st.write("Processing chat input...")
+        st.write(f"Prompt: {prompt}")
+        st.write(f"Model: {chat_service.model}")
+        st.write(f"Custom Instructions: {bool(chat_service.custom_instructions)}")
+        
+        if st.session_state.current_repo:
+            st.write("\nRepository Context:")
+            st.json(st.session_state.current_repo)
+    
+    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
     
-    # Get AI response
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = chat_service.generate_response(
+                # Get relevant code
+                if chat_service.embeddings_manager:
+                    relevant_code = asyncio.run(chat_service.embeddings_manager.search_code(prompt))
+                
+                # Generate response
+                response = asyncio.run(chat_service.generate_response(
                     prompt,
                     st.session_state.current_repo
-                )
+                ))
+                
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": response
                 })
                 st.markdown(response)
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        st.error(f"Error generating response: {str(e)}")
 
 def save_current_chat(settings_manager: SettingsManager):
     """Save current chat session"""
@@ -141,18 +168,18 @@ def main():
             with st.spinner("Analyzing repository..."):
                 try:
                     _, _, github_service = init_services()
-                    repo_info = github_service.analyze_repository(repo_url)
+                    repo_info = analyze_repository_async(github_service, repo_url)
                     st.session_state.current_repo = repo_info
                     
                     # Enhanced success message
                     st.success(f"""
-        Repository analyzed successfully!
-        - Name: {repo_info['name']}
-        - Language: {repo_info.get('language', 'Not specified')}
-        - Files in root: {repo_info.get('root_files', 0)}
-        - Total files: {repo_info.get('total_files', 0)}
-        - Directories: {len(repo_info.get('directories', []))}
-        - Last updated: {repo_info.get('last_updated', 'Unknown')}
+Repository analyzed successfully!
+- Name: {repo_info['name']}
+- Language: {repo_info.get('language', 'Not specified')}
+- Files in root: {repo_info.get('root_files', 0)}
+- Total files: {repo_info.get('total_files', 0)}
+- Directories: {len(repo_info.get('directories', []))}
+- Last updated: {repo_info.get('last_updated', 'Unknown')}
                     """)
                     
                     # Show additional info in expandable section
@@ -211,11 +238,19 @@ def main():
     
     # Chat input
     if prompt := st.chat_input("Ask about the repository...", key="chat_input"):
-        handle_chat_input(prompt, chat_service := ChatService(
-            Anthropic(api_key=AppConfig().anthropic_api_key),
+        # Initialize services with embeddings manager
+        config = AppConfig()
+        anthropic_client = Anthropic(api_key=config.anthropic_api_key)
+        embeddings_manager = EmbeddingsManager(anthropic_client)
+        
+        chat_service = ChatService(
+            anthropic_client,
+            embeddings_manager=embeddings_manager,
             model=st.session_state.selected_model,
             custom_instructions=st.session_state.custom_instructions
-        ))
+        )
+        
+        handle_chat_input(prompt, chat_service)
 
 if __name__ == "__main__":
     main()
