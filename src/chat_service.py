@@ -1,86 +1,58 @@
 from anthropic import Anthropic
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
 
-MAX_TOKENS = 4096  # Increased from default
+MAX_TOKENS = 8192
 TEMPERATURE = 0.7
 
 class ChatService:
-    def __init__(self, anthropic_client: Anthropic, model: str = "claude-3-5-sonnet-latest", custom_instructions: str = ""):
+    def __init__(self, anthropic_client: Anthropic, model: str = "claude-3-sonnet-20240229", custom_instructions: str = ""):
         self.client = anthropic_client
         self.model = model
         self.custom_instructions = custom_instructions
-        self._setup_logging()
-
-    async def get_response(self, prompt: str, context: str = "") -> str:
-        try:
-            # Combine conversation history with new prompt
-            full_prompt = self._build_full_prompt(prompt, context)
-
-            response = await self.client.messages.create(
-                model="claude-3-opus-20240229",  # Using latest model
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": full_prompt
-                    }
-                ]
-            )
-
-            # Store conversation
-            self.conversation_history.append({
-                "role": "user",
-                "content": prompt
-            })
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": response.content[0].text
-            })
-
-            return response.content[0].text
-
-        except Exception as e:
-            logging.error(f"Error getting response from Claude: {e}")
-            return f"Error: {str(e)}"
-
-    def _build_full_prompt(self, prompt: str, context: str = "") -> str:
-        # Combine context with prompt
-        if context:
-            return f"Context:\n{context}\n\nQuestion: {prompt}"
-        return prompt
-
-    def clear_history(self):
         self.conversation_history = []
+        self._setup_logging()
 
     def _setup_logging(self):
         """Initialize logging"""
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-    def generate_response(self, prompt: str, repo_info: Optional[Dict] = None, messages: list = None) -> str:
+    def _build_full_prompt(self, prompt: str, context: str = "") -> str:
+        """Combine context with prompt"""
+        if context:
+            return f"Context:\n{context}\n\nQuestion: {prompt}"
+        return prompt
+
+    async def generate_response(self, prompt: str, repo_info: Optional[Dict] = None, messages: List[Dict] = None) -> str:
         """Generate a response using the Anthropic API"""
-        system_prompt = self._build_system_prompt(repo_info)
-        
         try:
+            system_prompt = self._build_system_prompt(repo_info)
+
             # Format messages for the API
             api_messages = []
             if messages:
-                api_messages.extend(messages)
+                api_messages.extend([
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in messages
+                ])
+            
             api_messages.append({
                 "role": "user",
                 "content": prompt
             })
-            
-            message = self.client.messages.create(
+
+            # Create the message using the sync API
+            response = self.client.messages.create(
                 model=self.model,
-                max_tokens=1000,
+                max_tokens=MAX_TOKENS,
                 messages=api_messages,
                 system=system_prompt
             )
-            
-            return message.content[0].text
+
+            # Extract and return the response text
+            return response.content[0].text
+
         except Exception as e:
             self.logger.error(f"Error generating response: {str(e)}")
             raise Exception(f"Error generating response: {str(e)}")
@@ -119,14 +91,6 @@ Repository Information:
                         for imp in imports:
                             repo_desc += f"- {imp}\n"
                 
-                # Add code analysis
-                if code_rel.get('code_analysis'):
-                    repo_desc += "\nCode Analysis:\n"
-                    for file, analysis in code_rel['code_analysis'].items():
-                        repo_desc += f"\n{file}:\n"
-                        repo_desc += f"- Size: {analysis.get('size', 'Unknown')} bytes\n"
-                        repo_desc += f"- Lines: {analysis.get('line_count', 'Unknown')}\n"
-            
             # Add structure information
             if 'file_types' in repo_info:
                 repo_desc += "\nFile Structure:\n"

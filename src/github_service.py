@@ -1,10 +1,14 @@
 from github import Github
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 import base64
 import logging
 from pathlib import Path
 import os
 import re
+import aiohttp
+import asyncio
+from github.Repository import Repository
+from github.ContentFile import ContentFile
 
 class GitHubService:
     def __init__(self, github_token: str):
@@ -15,20 +19,20 @@ class GitHubService:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-    def analyze_repository(self, repo_url: str) -> Dict:
-        """Analyze a GitHub repository comprehensively"""
+    async def analyze_repository(self, repo_url: str) -> Dict:
+        """Analyze a GitHub repository comprehensively using async operations"""
         self.logger.info(f"Starting analysis of repository: {repo_url}")
-        
+
         try:
             # Extract repository name from URL
             repo_name = repo_url.split('github.com/')[-1].rstrip('/')
             if repo_name.endswith('.git'):
                 repo_name = repo_name[:-4]
-            
-            # Get repository
+
+            # Get repository - this is synchronous but only done once
             repo = self.client.get_repo(repo_name)
-            
-            # Get basic info first
+
+            # Basic info gathering is synchronous but quick
             repo_info = {
                 'name': repo.name,
                 'full_name': repo.full_name,
@@ -44,48 +48,33 @@ class GitHubService:
                 'open_issues': repo.open_issues_count
             }
 
-            # Get root contents for file count
-            try:
-                root_contents = repo.get_contents("")
-                repo_info['root_files'] = len(root_contents) if isinstance(root_contents, list) else 1
-            except Exception as e:
-                self.logger.warning(f"Error getting root contents: {str(e)}")
-                repo_info['root_files'] = 0
+            # Run all async operations concurrently
+            structure_info, dependencies, readme_content = await asyncio.gather(
+                self._analyze_repository_structure(repo),
+                self._analyze_dependencies(repo),
+                self._get_readme_content(repo)
+            )
 
-            # Try to get structure info
-            try:
-                structure_info = self._analyze_repository_structure(repo)
-                repo_info.update(structure_info)
-            except Exception as e:
-                self.logger.warning(f"Error analyzing structure: {str(e)}")
-            # Code relationship analysis
+            # Update repo_info with results
+            repo_info.update(structure_info)
+            repo_info['dependencies'] = dependencies
+            if readme_content:
+                repo_info['readme'] = readme_content
+
+            # If we have code files, analyze their relationships
             if structure_info.get('code_files'):
-                code_relationships = self._analyze_code_relationships(repo, structure_info['code_files'])
+                code_relationships = await self._analyze_code_relationships(repo, structure_info['code_files'])
                 repo_info['code_relationships'] = code_relationships
-            # Try to get dependency info
-            try:
-                dependencies = self._analyze_dependencies(repo)
-                repo_info['dependencies'] = dependencies
-            except Exception as e:
-                self.logger.warning(f"Error analyzing dependencies: {str(e)}")
-
-            # Try to get README
-            try:
-                readme_content = self._get_readme_content(repo)
-                if readme_content:
-                    repo_info['readme'] = readme_content
-            except Exception as e:
-                self.logger.warning(f"Error getting README: {str(e)}")
 
             self.logger.info("Repository analysis completed successfully")
             return repo_info
-            
+
         except Exception as e:
             self.logger.error(f"Error in repository analysis: {str(e)}")
             raise Exception(f"Error analyzing repository: {str(e)}")
 
-    def _analyze_repository_structure(self, repo) -> Dict:
-        """Analyze the repository's file structure"""
+    async def _analyze_repository_structure(self, repo: Repository) -> Dict:
+        """Analyze the repository's file structure asynchronously"""
         structure = {
             'file_types': {},
             'directories': [],
@@ -93,9 +82,9 @@ class GitHubService:
             'code_files': []
         }
         
-        def process_contents(path: str = ''):
+        async def process_contents(path: str = ''):
             try:
-                contents = repo.get_contents(path)
+                contents = await self._get_contents(repo, path)
                 if not isinstance(contents, list):
                     contents = [contents]
                 
@@ -103,7 +92,7 @@ class GitHubService:
                     try:
                         if item.type == 'dir':
                             structure['directories'].append(item.path)
-                            process_contents(item.path)
+                            await process_contents(item.path)
                         else:
                             structure['total_files'] += 1
                             ext = Path(item.path).suffix
@@ -120,11 +109,11 @@ class GitHubService:
             except Exception as e:
                 self.logger.warning(f"Error accessing path {path}: {str(e)}")
 
-        process_contents()
+        await process_contents()
         return structure
 
-    def _analyze_dependencies(self, repo) -> Dict:
-        """Analyze repository dependencies"""
+    async def _analyze_dependencies(self, repo: Repository) -> Dict:
+        """Analyze repository dependencies asynchronously"""
         dependencies = {
             'package_json': None,
             'requirements_txt': None,
@@ -139,36 +128,32 @@ class GitHubService:
             'pyproject.toml'
         ]
 
-        for file_name in dependency_files:
+        async def get_file_content(file_name: str):
             try:
-                file_content = repo.get_contents(file_name)
-                content = base64.b64decode(file_content.content).decode('utf-8')
-                key = file_name.replace('.', '_').replace('-', '_').lower()
-                dependencies[key] = content
+                file_content = await self._get_contents(repo, file_name)
+                if file_content:
+                    content = base64.b64decode(file_content.content).decode('utf-8')
+                    key = file_name.replace('.', '_').replace('-', '_').lower()
+                    dependencies[key] = content
             except Exception:
-                continue
+                pass
 
+        # Get all dependency files concurrently
+        await asyncio.gather(*[get_file_content(file_name) for file_name in dependency_files])
         return dependencies
-    
-    def _analyze_code_relationships(self, repo, code_files: List[Dict]) -> Dict:
-        """Analyze relationships between code files"""
+
+    async def _analyze_code_relationships(self, repo: Repository, code_files: List[Dict]) -> Dict:
+        """Analyze relationships between code files asynchronously"""
         relationships = {
             'imports_graph': {},
             'entry_points': [],
             'component_hierarchy': {},
             'code_analysis': {}
         }
-        
-        for file_info in code_files:
-            try:
-                content = None
-                try:
-                    file_content = repo.get_contents(file_info['path'])
-                    content = base64.b64decode(file_content.content).decode('utf-8')
-                except Exception as e:
-                    self.logger.warning(f"Error getting content for {file_info['path']}: {str(e)}")
-                    continue
 
+        async def analyze_file(file_info: Dict):
+            try:
+                content = await self._get_file_content(repo, file_info['path'])
                 if content:
                     # Basic code analysis based on file type
                     ext = file_info['type'].lower()
@@ -202,19 +187,39 @@ class GitHubService:
                         'type': file_info['type'],
                         'line_count': len(content.splitlines()),
                     }
-
             except Exception as e:
                 self.logger.warning(f"Error analyzing {file_info['path']}: {str(e)}")
-        
+
+        # Analyze all files concurrently
+        await asyncio.gather(*[analyze_file(file_info) for file_info in code_files])
         return relationships
 
-    def _get_readme_content(self, repo) -> Optional[str]:
-        """Get repository README content"""
+    async def _get_readme_content(self, repo: Repository) -> Optional[str]:
+        """Get repository README content asynchronously"""
         try:
-            readme = repo.get_readme()
-            return base64.b64decode(readme.content).decode('utf-8')
+            readme = await self._get_contents(repo, "README.md")
+            if not readme:
+                readme = await self._get_contents(repo, "README.rst")
+            if readme:
+                return base64.b64decode(readme.content).decode('utf-8')
         except Exception:
             return None
+        return None
+
+    async def _get_contents(self, repo: Repository, path: str) -> Union[ContentFile, List[ContentFile]]:
+        """Get repository contents asynchronously"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, repo.get_contents, path)
+
+    async def _get_file_content(self, repo: Repository, path: str) -> Optional[str]:
+        """Get file content asynchronously"""
+        try:
+            content = await self._get_contents(repo, path)
+            if content:
+                return base64.b64decode(content.content).decode('utf-8')
+        except Exception as e:
+            self.logger.warning(f"Error getting content for {path}: {str(e)}")
+        return None
 
     def _is_code_file(self, path: str) -> bool:
         """Determine if a file is a code file based on extension"""

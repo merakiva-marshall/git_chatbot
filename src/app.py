@@ -6,6 +6,8 @@ from config import AppConfig
 from chat_service import ChatService
 from github_service import GitHubService
 from utils.settings_manager import SettingsManager
+import asyncio
+from functools import partial
 
 # Load environment variables
 load_dotenv()
@@ -14,6 +16,15 @@ CLAUDE_MODELS = {
     "Claude 3.5 Sonnet": "claude-3-5-sonnet-latest",
     "Claude 3.5 Haiku": "claude-3-5-haiku-latest",
 }
+
+def run_async(coroutine):
+    """Helper function to run async functions in Streamlit"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coroutine)
 
 def init_services():
     config = AppConfig()
@@ -55,33 +66,33 @@ def format_conversation_history():
 def handle_chat_input(prompt: str, chat_service: ChatService):
     if not prompt.strip():
         return
-    
+
     with st.chat_message("user"):
         st.markdown(prompt)
-    
-    # Add user message to history
+
     st.session_state.conversation_history.append({
         "role": "user",
         "content": prompt
     })
-    
+
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                # Pass entire conversation history to generate_response
                 messages = format_conversation_history()
-                response = chat_service.generate_response(
+                response = run_async(chat_service.generate_response(
                     prompt,
                     st.session_state.current_repo,
-                    messages=messages[:-1]  # Exclude the last message since it's the current prompt
-                )
+                    messages=messages[:-1]  # Exclude the current prompt
+                ))
                 
-                # Add assistant response to history
-                st.session_state.conversation_history.append({
-                    "role": "assistant",
-                    "content": response
-                })
-                st.markdown(response)
+                if response:
+                    st.session_state.conversation_history.append({
+                        "role": "assistant",
+                        "content": response
+                    })
+                    st.markdown(response)
+                else:
+                    st.error("No response received from the assistant")
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
@@ -148,7 +159,8 @@ def main():
             with st.spinner("Analyzing repository..."):
                 try:
                     _, _, github_service = init_services()
-                    repo_info = github_service.analyze_repository(repo_url)
+                    # Properly await the async analyze_repository method
+                    repo_info = run_async(github_service.analyze_repository(repo_url))
                     st.session_state.current_repo = repo_info
                     
                     # Enhanced success message
@@ -218,11 +230,12 @@ def main():
     
     # Chat input 
     if prompt := st.chat_input("Ask about the repository...", key="chat_input"):
-        handle_chat_input(prompt, chat_service := ChatService(
+        chat_service = ChatService(
             Anthropic(api_key=AppConfig().anthropic_api_key),
             model=st.session_state.selected_model,
             custom_instructions=st.session_state.custom_instructions
-        ))
+        )
+        handle_chat_input(prompt, chat_service)
 
 if __name__ == "__main__":
     main()
