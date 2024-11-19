@@ -79,20 +79,26 @@ def handle_chat_input(prompt: str, chat_service: ChatService):
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 messages = format_conversation_history()
-                response = run_async(chat_service.generate_response(
-                    prompt,
-                    st.session_state.current_repo,
-                    messages=messages[:-1]  # Exclude the current prompt
-                ))
-                
-                if response:
-                    st.session_state.conversation_history.append({
-                        "role": "assistant",
-                        "content": response
-                    })
-                    st.markdown(response)
-                else:
-                    st.error("No response received from the assistant")
+                try:
+                    response = run_async(chat_service.generate_response(
+                        prompt,
+                        st.session_state.current_repo,
+                        messages=messages[:-1]
+                    ))
+                    
+                    if response:
+                        st.session_state.conversation_history.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+                        st.markdown(response)
+                    else:
+                        st.error("No response received from the assistant")
+                except Exception as e:
+                    if "overloaded" in str(e).lower():
+                        st.error("The service is temporarily busy. Please wait a moment and try again.")
+                    else:
+                        st.error(f"Error: {str(e)}")
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
@@ -159,17 +165,17 @@ def main():
             with st.spinner("Analyzing repository..."):
                 try:
                     _, _, github_service = init_services()
-                    # Properly await the async analyze_repository method
                     repo_info = run_async(github_service.analyze_repository(repo_url))
                     st.session_state.current_repo = repo_info
                     
-                    # Enhanced success message
+                    # Enhanced success message with branch and path info
                     st.success(f"""
         Repository analyzed successfully!
         - Name: {repo_info['name']}
+        - Branch: {repo_info.get('current_branch', 'default')}
+        - Path: {repo_info.get('current_path', 'root')}
         - Language: {repo_info.get('language', 'Not specified')}
-        - Files in root: {repo_info.get('root_files', 0)}
-        - Total files: {repo_info.get('total_files', 0)}
+        - Files in scope: {repo_info.get('total_files', 0)}
         - Directories: {len(repo_info.get('directories', []))}
         - Last updated: {repo_info.get('last_updated', 'Unknown')}
                     """)
@@ -184,10 +190,29 @@ def main():
                             st.write("📦 Found package.json (Node.js/JavaScript project)")
                         if repo_info.get('dependencies', {}).get('requirements_txt'):
                             st.write("📦 Found requirements.txt (Python project)")
-                            
+                    
                 except Exception as e:
                     st.error(f"Error analyzing repository: {str(e)}")
         
+        #File Verification Debug
+        if st.session_state.get('current_repo'):
+            st.write("### Content Verification")
+            verify_file = st.text_input("Enter file path to verify:")
+            if verify_file and st.button("Verify File Content"):
+                try:
+                    # Initialize services first
+                    config, _, github_service = init_services()
+                    content = run_async(github_service.verify_branch_content(repo_url, verify_file))
+                    st.code(content[:500] + "..." if len(content) > 500 else content)
+                except Exception as e:
+                    st.error(f"Error verifying file: {e}")
+
+        if st.sidebar.button("Show Diagnostic Info"):
+            if 'current_repo' in st.session_state:
+                config, _, github_service = init_services()  # Initialize services first
+                st.sidebar.json(github_service.get_retrieval_stats())
+                st.sidebar.write("Session State Keys:", list(st.session_state.keys()))
+                
         # Chat session management
         st.header("Chat Sessions")
         chat_title = st.text_input(
