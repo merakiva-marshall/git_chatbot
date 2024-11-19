@@ -10,18 +10,15 @@ from utils.settings_manager import SettingsManager
 # Load environment variables
 load_dotenv()
 
-# Available Claude models
 CLAUDE_MODELS = {
-    "Claude 3 Opus": "claude-3-opus-20240229",
-    "Claude 3 Sonnet": "claude-3-sonnet-20240229",
-    "Claude 3 Haiku": "claude-3-haiku-20240307",
+    "Claude 3.5 Sonnet": "claude-3-5-sonnet-latest",
+    "Claude 3.5 Haiku": "claude-3-5-haiku-latest",
 }
 
 def init_services():
-    """Initialize all required services"""
     config = AppConfig()
     anthropic_client = Anthropic(api_key=config.anthropic_api_key)
-    selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3 Sonnet"])
+    selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"])
     chat_service = ChatService(
         anthropic_client, 
         model=selected_model,
@@ -31,41 +28,56 @@ def init_services():
     return config, chat_service, github_service
 
 def init_session_state(settings_manager: SettingsManager):
-    """Initialize session state with saved settings"""
     settings = settings_manager.get_settings()
+    defaults = {
+        "messages": [],
+        "current_repo": None,
+        "selected_model": settings.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"]),
+        "custom_instructions": settings.get('custom_instructions', ''),
+        "last_repo": settings.get('last_repo', ''),
+        "waiting_for_response": False,
+        "conversation_history": []
+    }
     
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "current_repo" not in st.session_state:
-        st.session_state.current_repo = None
-    if "selected_model" not in st.session_state:
-        st.session_state.selected_model = settings.get('selected_model', CLAUDE_MODELS["Claude 3 Sonnet"])
-    if "custom_instructions" not in st.session_state:
-        st.session_state.custom_instructions = settings.get('custom_instructions', '')
-    if "last_repo" not in st.session_state:
-        st.session_state.last_repo = settings.get('last_repo', '')
-    if "waiting_for_response" not in st.session_state:
-        st.session_state.waiting_for_response = False
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+def format_conversation_history():
+    formatted_messages = []
+    for msg in st.session_state.conversation_history:
+        formatted_messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    return formatted_messages
 
 def handle_chat_input(prompt: str, chat_service: ChatService):
-    """Handle chat input and update messages"""
     if not prompt.strip():
         return
     
-    # Display user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
     
-    # Get AI response
+    # Add user message to history
+    st.session_state.conversation_history.append({
+        "role": "user",
+        "content": prompt
+    })
+    
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
+                # Pass entire conversation history to generate_response
+                messages = format_conversation_history()
                 response = chat_service.generate_response(
                     prompt,
-                    st.session_state.current_repo
+                    st.session_state.current_repo,
+                    messages=messages[:-1]  # Exclude the last message since it's the current prompt
                 )
-                st.session_state.messages.append({
+                
+                # Add assistant response to history
+                st.session_state.conversation_history.append({
                     "role": "assistant",
                     "content": response
                 })
@@ -74,11 +86,10 @@ def handle_chat_input(prompt: str, chat_service: ChatService):
         st.error(f"Error: {str(e)}")
 
 def save_current_chat(settings_manager: SettingsManager):
-    """Save current chat session"""
-    if st.session_state.messages:
+    if st.session_state.conversation_history:
         chat_title = st.session_state.get('chat_title', f"Chat {len(settings_manager.get_chat_sessions()) + 1}")
         filename = settings_manager.save_chat_session(
-            st.session_state.messages,
+            st.session_state.conversation_history,
             st.session_state.current_repo,
             chat_title
         )
@@ -92,18 +103,14 @@ def main():
     )
     
     settings_manager = SettingsManager()
+    init_session_state(settings_manager)
     
     st.title("Git Chatbot")
     st.caption("Chat with your GitHub repositories using Claude")
     
-    # Initialize session state
-    init_session_state(settings_manager)
-    
-    # Sidebar for settings
     with st.sidebar:
         st.header("Settings")
         
-        # Model selection
         selected_model_name = st.selectbox(
             "Select Claude Model",
             options=list(CLAUDE_MODELS.keys()),
@@ -205,11 +212,11 @@ def main():
     
     # Display chat history
     with chat_container:
-        for message in st.session_state.messages:
+        for message in st.session_state.conversation_history:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
     
-    # Chat input
+    # Chat input 
     if prompt := st.chat_input("Ask about the repository...", key="chat_input"):
         handle_chat_input(prompt, chat_service := ChatService(
             Anthropic(api_key=AppConfig().anthropic_api_key),

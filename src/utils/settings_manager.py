@@ -19,7 +19,7 @@ class SettingsManager:
             self._save_settings({
                 "custom_instructions": "",
                 "last_repo": "",
-                "selected_model": "claude-3-sonnet-20240229"
+                "selected_model": "claude-3-5-sonnet-latest"
             })
 
     def _save_settings(self, settings: Dict):
@@ -36,7 +36,7 @@ class SettingsManager:
             return {
                 "custom_instructions": "",
                 "last_repo": "",
-                "selected_model": "claude-3-sonnet-20240229"
+                "selected_model": "claude-3-5-sonnet-latest"
             }
 
     def update_settings(self, settings: Dict):
