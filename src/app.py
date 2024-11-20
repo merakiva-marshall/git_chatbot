@@ -105,7 +105,6 @@ def format_conversation_history():
     return formatted_messages
 
 async def handle_chat_input(prompt: str, chat_service: ChatService):
-    """Handle chat input with embeddings support"""
     if not prompt.strip():
         return
 
@@ -122,6 +121,9 @@ async def handle_chat_input(prompt: str, chat_service: ChatService):
             with st.spinner("Thinking..."):
                 messages = format_conversation_history()
 
+                # Ensure current_repo information is available
+                repo_info = st.session_state.get('current_repo', {})
+
                 # Get relevant code context using embeddings
                 relevant_code = None
                 if chat_service.embeddings_manager:
@@ -133,7 +135,7 @@ async def handle_chat_input(prompt: str, chat_service: ChatService):
                 try:
                     response = await chat_service.generate_response(
                         prompt,
-                        st.session_state.current_repo,
+                        repo_info=repo_info,  # Pass repo_info explicitly
                         messages=messages[:-1],
                         code_context=relevant_code
                     )
@@ -244,6 +246,7 @@ def main():
                     st.write(f"Repository URL: {repo_url}")
 
                     repo_info = run_async(github_service.analyze_repository(repo_url))
+                    st.session_state.current_repo = repo_info
 
                     # Debug output
                     st.write("\nDebug Information:")

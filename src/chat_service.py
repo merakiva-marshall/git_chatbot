@@ -128,80 +128,46 @@ class ChatService:
 
     def _build_system_prompt(self, repo_info: Optional[Dict], code_context: Optional[List[Dict]] = None) -> str:
         """Build detailed system prompt with repository information and code context"""
+        # Start with a base system prompt
         system_prompt = "You are an expert software developer that has access to Github repositories. "
         system_prompt += "You will use your knowledge and understanding of the files & structure in the GitHub repository to write excellent code and troubleshoot problems. "
         system_prompt += "Before writing code, you'll think critically about dependencies and elements to include."
 
+        # Add custom instructions if available
         if self.custom_instructions:
             system_prompt += f"\n\nCustom Instructions:\n{self.custom_instructions}"
 
+        # Add repository information if available
+        if repo_info:
+            system_prompt += "\n\nRepository Context:\n"
+
+            # Basic repository details
+            system_prompt += f"- Repository Name: {repo_info.get('name', 'Unknown')}\n"
+            system_prompt += f"- Description: {repo_info.get('description', 'No description')}\n"
+            system_prompt += f"- Primary Language: {repo_info.get('language', 'Not specified')}\n"
+            system_prompt += f"- Current Branch: {repo_info.get('current_branch', 'default')}\n"
+
+            # File types and structure
+            if repo_info.get('file_types'):
+                system_prompt += "\nFile Types:\n"
+                for ext, count in repo_info['file_types'].items():
+                    system_prompt += f"- {ext or 'No extension'}: {count} files\n"
+
+            # Directories
+            if repo_info.get('directories'):
+                system_prompt += "\nDirectories:\n"
+                for directory in sorted(repo_info['directories'])[:10]:  # Limit to 10 directories
+                    system_prompt += f"- {directory}\n"
+
+            # Total files
+            system_prompt += f"\nTotal Files: {repo_info.get('total_files', 0)}"
+
+        # Add code context if available
         if code_context:
             system_prompt += "\n\nRelevant Code Context:\n"
             for ctx in code_context:
                 system_prompt += f"\nFile: {ctx.get('file')}\n"
                 system_prompt += f"Type: {ctx.get('type')}\n"
                 system_prompt += f"Content:\n{ctx.get('content')}\n"
-
-        if repo_info:
-            # Basic repo info
-            repo_desc = f"""
-Repository Information:
-- Name: {repo_info.get('name', 'Unknown')}
-- Description: {repo_info.get('description', 'No description available')}
-- Primary Language: {repo_info.get('language', 'Not specified')}
-- Current Branch: {repo_info.get('current_branch', 'default branch')}
-- Current Path: {repo_info.get('current_path', 'root')}
-- Topics: {', '.join(repo_info.get('topics', []))}
-"""
-            # Add context about which version is being analyzed
-            if repo_info.get('current_branch'):
-                repo_desc += f"\nNote: All code and analysis is from the '{repo_info['current_branch']}' branch"
-                if repo_info.get('current_path'):
-                    repo_desc += f" at path '{repo_info['current_path']}'"
-                repo_desc += ".\n"
-
-            # Add file contents if available
-            if 'file_contents' in repo_info:
-                repo_desc += "\nFile Contents:\n"
-                for file_path, content in repo_info['file_contents'].items():
-                    repo_desc += f"\n--- {file_path} ---\n{content}\n"
-
-            # Add code relationships
-            if 'code_relationships' in repo_info:
-                code_rel = repo_info['code_relationships']
-
-                if code_rel.get('entry_points'):
-                    repo_desc += "\nEntry Points:\n"
-                    for entry in code_rel['entry_points']:
-                        repo_desc += f"- {entry}\n"
-
-                if code_rel.get('imports_graph'):
-                    repo_desc += "\nFile Dependencies:\n"
-                    for file, imports in code_rel['imports_graph'].items():
-                        repo_desc += f"\n{file} imports:\n"
-                        for imp in imports:
-                            repo_desc += f"- {imp}\n"
-
-            # Add structure information
-            if 'file_types' in repo_info:
-                repo_desc += "\nFile Structure:\n"
-                for ext, count in repo_info['file_types'].items():
-                    repo_desc += f"- {ext or 'no extension'}: {count} files\n"
-
-            if 'directories' in repo_info:
-                repo_desc += f"\nDirectories ({len(repo_info['directories'])} total):\n"
-                for directory in sorted(repo_info['directories'])[:10]:
-                    repo_desc += f"- {directory}\n"
-
-            if 'dependencies' in repo_info and any(repo_info['dependencies'].values()):
-                repo_desc += "\nDependencies:\n"
-                for dep_file, content in repo_info['dependencies'].items():
-                    if content:
-                        repo_desc += f"- Found {dep_file}\n"
-
-            system_prompt += f"\n\nDetailed Repository Analysis:\n{repo_desc}"
-
-            if 'readme' in repo_info and repo_info['readme']:
-                system_prompt += "\n\nREADME Content:\n" + repo_info['readme']
 
         return system_prompt
