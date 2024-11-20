@@ -301,7 +301,7 @@ Analysis Details:
                 self.logger.error(f"Error generating embeddings: {str(e)}")
                 repo_info['embedding_error'] = str(e)
 
-    def _analyze_repository_structure(self, repo) -> Dict:
+    async def _analyze_repository_structure(self, repo: Repository, branch: Optional[str] = None, path: Optional[str] = None) -> Dict:
         """Analyze the repository's file structure with debugging"""
         structure = {
             'file_types': {},
@@ -309,52 +309,83 @@ Analysis Details:
             'total_files': 0,
             'code_files': []
         }
-        
-        def process_contents(path: str = ''):
-            try:
-                # Debug log
-                self.logger.info(f"Processing path: {path}")
-                
-                contents = repo.get_contents(path)
-                if not isinstance(contents, list):
-                    contents = [contents]
-                
-                for item in contents:
-                    try:
-                        if item.type == 'dir':
-                            structure['directories'].append(item.path)
-                            # Debug log
-                            self.logger.info(f"Found directory: {item.path}")
-                            process_contents(item.path)
-                        else:
-                            structure['total_files'] += 1
-                            ext = Path(item.path).suffix
-                            structure['file_types'][ext] = structure['file_types'].get(ext, 0) + 1
-                            
-                            if self._is_code_file(item.path):
-                                # Debug log
-                                self.logger.info(f"Found code file: {item.path}")
-                                structure['code_files'].append({
-                                    'path': item.path,
-                                    'size': item.size,
-                                    'type': ext
-                                })
-                    except Exception as e:
-                        self.logger.warning(f"Error processing item {item.path}: {str(e)}")
-            except Exception as e:
-                self.logger.warning(f"Error accessing path {path}: {str(e)}")
 
-        process_contents()
-        
-        # Debug summary
-        self.logger.info(f"Analysis complete. Found:")
-        self.logger.info(f"- {len(structure['directories'])} directories")
-        self.logger.info(f"- {structure['total_files']} total files")
-        self.logger.info(f"- {len(structure['code_files'])} code files")
-        
-        return structure
+        try:
+            async def process_contents(current_path: str = ''):
+                try:
+                    self.logger.info(f"Processing path: {current_path}")
 
-    def _analyze_dependencies(self, repo) -> Dict:
+                    # Get contents using tracked method with proper ref
+                    contents = await self.tracked_get_contents(
+                        repo, 
+                        current_path, 
+                        ref=self._current_commit_sha if self._current_commit_sha else branch
+                    )
+
+                    if not isinstance(contents, list):
+                        contents = [contents]
+
+                    for item in contents:
+                        try:
+                            # If a specific path is provided, only process that path
+                            if path and not item.path.startswith(path):
+                                continue
+
+                            if item.type == 'dir':
+                                structure['directories'].append(item.path)
+                                self.logger.info(f"Found directory: {item.path}")
+                                await process_contents(item.path)
+                            else:
+                                structure['total_files'] += 1
+                                ext = Path(item.path).suffix
+                                structure['file_types'][ext] = structure['file_types'].get(ext, 0) + 1
+
+                                if self._is_code_file(item.path):
+                                    self.logger.info(f"Found code file: {item.path}")
+                                    structure['code_files'].append({
+                                        'path': item.path,
+                                        'size': item.size,
+                                        'type': ext,
+                                        'sha': item.sha,
+                                        'url': item.html_url,
+                                        'last_modified': None  # Will be populated when content is retrieved
+                                    })
+                        except Exception as e:
+                            self.logger.warning(f"Error processing item {item.path}: {str(e)}")
+                            continue
+
+                except Exception as e:
+                    self.logger.warning(f"Error accessing path {current_path}: {str(e)}")
+                    return
+
+            # Start processing from the specified path or root
+            initial_path = path if path else ''
+            await process_contents(initial_path)
+
+            # Debug summary
+            self.logger.info(f"""
+    Analysis complete:
+    - Directories: {len(structure['directories'])}
+    - Total files: {structure['total_files']}
+    - Code files: {len(structure['code_files'])}
+    - File types: {dict(structure['file_types'])}
+            """)
+
+            return structure
+
+        except Exception as e:
+            self.logger.error(f"Error in repository structure analysis: {str(e)}")
+            raise
+
+    def _is_code_file(self, path: str) -> bool:
+        """Determine if a file is a code file based on extension"""
+        code_extensions = {
+            '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c',
+            '.h', '.cs', '.rb', '.php', '.go', '.rs', '.swift', '.kt',
+            '.dart', '.vue', '.scala', '.r', '.jl'
+        }
+        return Path(path).suffix.lower() in code_extensions
+    async def _analyze_dependencies(self, repo: Repository, branch: Optional[str] = None, path: Optional[str] = None) -> Dict:
         """Analyze repository dependencies"""
         dependencies = {
             'package_json': None,
@@ -362,7 +393,7 @@ Analysis Details:
             'pipfile': None,
             'poetry': None
         }
-        
+
         dependency_files = [
             'package.json',
             'requirements.txt',
@@ -372,12 +403,47 @@ Analysis Details:
 
         for file_name in dependency_files:
             try:
-                file_content = repo.get_contents(file_name)
-                content = base64.b64decode(file_content.content).decode('utf-8')
-                key = file_name.replace('.', '_').replace('-', '_').lower()
-                dependencies[key] = content
-            except Exception:
+                # Use tracked_get_contents to handle rate limiting and caching
+                file_content = await self.tracked_get_contents(
+                    repo,
+                    file_name,
+                    ref=self._current_commit_sha if self._current_commit_sha else branch
+                )
+
+                if file_content:
+                    content = base64.b64decode(file_content.content).decode('utf-8')
+                    key = file_name.replace('.', '_').replace('-', '_').lower()
+                    dependencies[key] = content
+                    self.logger.info(f"Found dependency file: {file_name}")
+            except Exception as e:
+                self.logger.debug(f"Dependency file {file_name} not found: {str(e)}")
                 continue
+
+        # Additional dependency analysis
+        try:
+            # Look for other potential dependency files in the repository
+            additional_patterns = [
+                'yarn.lock',
+                'package-lock.json',
+                'poetry.lock',
+                'Pipfile.lock',
+                'setup.py'
+            ]
+
+            for pattern in additional_patterns:
+                try:
+                    file_content = await self.tracked_get_contents(
+                        repo,
+                        pattern,
+                        ref=self._current_commit_sha if self._current_commit_sha else branch
+                    )
+                    if file_content:
+                        dependencies[f'has_{pattern.replace(".", "_").lower()}'] = True
+                except Exception:
+                    continue
+
+        except Exception as e:
+            self.logger.warning(f"Error in additional dependency analysis: {str(e)}")
 
         return dependencies
     
@@ -439,12 +505,34 @@ Analysis Details:
         
         return relationships
 
-    def _get_readme_content(self, repo) -> Optional[str]:
+    async def _get_readme_content(self, repo: Repository, branch: Optional[str] = None, path: Optional[str] = None) -> Optional[str]:
         """Get repository README content"""
         try:
-            readme = repo.get_readme()
-            return base64.b64decode(readme.content).decode('utf-8')
-        except Exception:
+            # Use tracked_get_contents to handle rate limiting and caching
+            readme_paths = ['README.md', 'README.rst', 'README', 'README.txt']
+
+            for readme_path in readme_paths:
+                try:
+                    readme_content = await self.tracked_get_contents(
+                        repo,
+                        readme_path,
+                        ref=self._current_commit_sha if self._current_commit_sha else branch
+                    )
+
+                    if readme_content:
+                        content = base64.b64decode(readme_content.content).decode('utf-8')
+                        self.logger.info(f"Found README at: {readme_path}")
+                        return content
+
+                except Exception as e:
+                    self.logger.debug(f"README not found at {readme_path}: {str(e)}")
+                    continue
+
+            self.logger.info("No README found in repository")
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"Error getting README content: {str(e)}")
             return None
 
     def _is_code_file(self, path: str) -> bool:
