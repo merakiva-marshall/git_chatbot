@@ -1,112 +1,305 @@
 from github import Github
-from typing import Dict, List, Optional
-import base64
-import logging
+from typing import Dict, List, Optional, Tuple, Union, Any
+from urllib.parse import urlparse, unquote
 from pathlib import Path
-import os
+import logging
+import asyncio
+import base64
 import re
+from github.Repository import Repository
+from github.ContentFile import ContentFile
+import time
 from vector_store.embeddings_manager import EmbeddingsManager
 
 class GitHubService:
     def __init__(self, github_token: str, embeddings_manager: Optional[EmbeddingsManager] = None):
         self.client = Github(github_token)
+        self.logger = self._setup_logging()
+        self._content_cache = {}  # Track content retrievals
+        self._current_commit_sha = None  # Track current commit SHA
         self.embeddings_manager = embeddings_manager
-        self._setup_logging()
-        
-    def _setup_logging(self):
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        self._setup_rate_limiting()
+
+    def _setup_logging(self) -> logging.Logger:
+        """Initialize logging"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logger = logging.getLogger(__name__)
+        return logger
+
+    def _setup_rate_limiting(self):
+        """Setup rate limiting for GitHub API"""
+        self._request_lock = asyncio.Lock()
+        self._last_request_time = 0
+        self.MIN_REQUEST_INTERVAL = 1  # seconds between requests
+
+    async def verify_branch_content(self, repo_url: str, file_path: str) -> Optional[str]:
+        """Verify the exact content and metadata we're getting from GitHub"""
+        try:
+            repo_full_name, branch, path = self._parse_github_url(repo_url)
+            repo = self.client.get_repo(repo_full_name)
+
+            # Get branch information
+            if branch:
+                branch_obj = repo.get_branch(branch)
+                self.logger.info(f"""
+    Branch Information:
+    - Name: {branch}
+    - Latest commit SHA: {branch_obj.commit.sha}
+    - Commit date: {branch_obj.commit.commit.author.date}
+    - Commit message: {branch_obj.commit.commit.message}
+    """)
+
+                # Get the file content directly using the commit SHA
+                file_content = await self._get_contents(repo, file_path, ref=branch_obj.commit.sha)
+                if file_content:
+                    content = base64.b64decode(file_content.content).decode('utf-8')
+                    self.logger.info(f"""
+    File Information:
+    - Path: {file_path}
+    - SHA: {file_content.sha}
+    - Size: {len(content)} bytes
+    - First 200 chars: 
+    {content[:200]}
+    """)
+                    return content
+
+        except Exception as e:
+            self.logger.error(f"Verification failed: {str(e)}")
+            raise
+
+    async def _get_contents(self, repo: Repository, path: str, ref: Optional[str] = None) -> Union[ContentFile, List[ContentFile]]:
+        """Get repository contents asynchronously with rate limiting"""
+        async with self._request_lock:
+            current_time = time.time()
+            time_since_last_request = current_time - self._last_request_time
+            if time_since_last_request < self.MIN_REQUEST_INTERVAL:
+                await asyncio.sleep(self.MIN_REQUEST_INTERVAL - time_since_last_request)
+
+            loop = asyncio.get_event_loop()
+            try:
+                self.logger.info(f"Getting contents for path: {path}, ref: {ref}")
+
+                # Use commit SHA when possible
+                if ref and len(ref) == 40 and all(c in '0123456789abcdef' for c in ref.lower()):
+                    self.logger.info(f"Using provided SHA: {ref}")
+                elif ref and self._current_commit_sha:
+                    ref = self._current_commit_sha
+                    self.logger.info(f"Using stored SHA: {ref}")
+                elif ref and '/' not in ref:
+                    try:
+                        branch = repo.get_branch(ref)
+                        ref = branch.commit.sha
+                        self.logger.info(f"Using commit SHA {ref} for branch {branch.name}")
+                    except Exception as e:
+                        self.logger.warning(f"Could not get branch SHA, using ref as-is: {e}")
+
+                result = await loop.run_in_executor(
+                    None, 
+                    lambda: repo.get_contents(path, ref=ref)
+                )
+
+                self._last_request_time = time.time()
+                return result
+
+            except Exception as e:
+                self.logger.warning(f"Error getting contents for path {path} with ref {ref}: {str(e)}")
+                raise
+
+    async def tracked_get_contents(self, repo: Repository, path: str, ref: Optional[str] = None) -> Union[ContentFile, List[ContentFile]]:
+        """Track all content retrievals with caching"""
+        self.logger.info(f"Attempting to get contents for {path}:{ref}")
+        key = f"{path}:{ref}"
+
+        if key in self._content_cache:
+            cache_entry = self._content_cache[key]
+            # Check if cache is still valid (1 hour)
+            if time.time() - cache_entry['time'] < 3600:
+                self.logger.info(f"Cache hit for {key}")
+                return cache_entry['content']
+            else:
+                self.logger.info(f"Cache expired for {key}")
+                del self._content_cache[key]
+
+        self.logger.info(f"Cache miss for {key}")
+        content = await self._get_contents(repo, path, ref)
+        self._content_cache[key] = {
+            'time': time.time(),
+            'content': content,
+            'sha': getattr(content, 'sha', None)
+        }
+        self.logger.info(f"Cached content for {key} with SHA: {self._content_cache[key]['sha']}")
+        return content
+
+    def _parse_github_url(self, url: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Parse GitHub URL to extract owner, repo name, and branch/ref"""
+        url = url.strip().rstrip('/')
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        if len(path_parts) < 2:
+            raise ValueError("Invalid GitHub URL format")
+
+        owner = path_parts[0]
+        repo_name = path_parts[1].replace('.git', '')
+        repo_full_name = f"{owner}/{repo_name}"
+
+        branch = None
+        path = None
+
+        if len(path_parts) > 2:
+            if path_parts[2] in ['tree', 'blob']:
+                if len(path_parts) > 3:
+                    branch = path_parts[3]
+                    if len(path_parts) > 4:
+                        path = '/'.join(path_parts[4:])
+            else:
+                branch = path_parts[2]
+                if len(path_parts) > 3:
+                    path = '/'.join(path_parts[3:])
+
+        if branch:
+            self.logger.info(f"""
+URL Parsing Details:
+- Full URL: {url}
+- Parsed path parts: {path_parts}
+- Detected branch: {branch}
+- Detected path: {path}
+- Repository: {repo_full_name}
+""")
+
+        return repo_full_name, branch, path
 
     async def analyze_repository(self, repo_url: str) -> Dict:
-        """Analyze a GitHub repository comprehensively"""
+        """Analyze a GitHub repository comprehensively with embedding support"""
         self.logger.info(f"Starting analysis of repository: {repo_url}")
-               
-        
+        self._content_cache.clear()  # Clear cache on new analysis
+
         try:
-            # Extract repository name from URL
-            repo_name = repo_url.split('github.com/')[-1].rstrip('/')
-            if repo_name.endswith('.git'):
-                repo_name = repo_name[:-4]
-            
-            # Get repository
-            repo = self.client.get_repo(repo_name)
-            
-            # Get basic info first
-            repo_info = {
-                'name': repo.name,
-                'full_name': repo.full_name,
-                'description': repo.description,
-                'default_branch': repo.default_branch,
-                'stars': repo.stargazers_count,
-                'forks': repo.forks_count,
-                'last_updated': repo.updated_at.isoformat(),
-                'language': repo.language,
-                'topics': repo.get_topics(),
-                'visibility': 'private' if repo.private else 'public',
-                'size': repo.size,
-                'open_issues': repo.open_issues_count
-            }
+            # Parse the GitHub URL
+            repo_full_name, branch, path = self._parse_github_url(repo_url)
+            repo = self.client.get_repo(repo_full_name)
 
-            # Get root contents for file count
-            try:
-                root_contents = repo.get_contents("")
-                repo_info['root_files'] = len(root_contents) if isinstance(root_contents, list) else 1
-            except Exception as e:
-                self.logger.warning(f"Error getting root contents: {str(e)}")
-                repo_info['root_files'] = 0
+            # Handle branch verification
+            if branch:
+                try:
+                    branch_obj = repo.get_branch(branch)
+                    self._current_commit_sha = branch_obj.commit.sha
+                    self.logger.info(f"""
+Analysis Details:
+- Repository: {repo_full_name}
+- Branch: {branch}
+- Commit SHA: {self._current_commit_sha}
+- Last Commit: {branch_obj.commit.commit.committer.date}
+""")
+                except Exception as e:
+                    await self._handle_branch_error(repo, branch, e)
 
-            # Try to get structure info
-            try:
-                structure_info = self._analyze_repository_structure(repo)
-                repo_info.update(structure_info)
-            except Exception as e:
-                self.logger.warning(f"Error analyzing structure: {str(e)}")
+            # Gather basic repository information
+            repo_info = await self._gather_basic_info(repo, branch, path)
 
-            # Process files for embeddings if manager is available
-            if self.embeddings_manager and structure_info.get('code_files'):
-                files_content = []
-                for file_info in structure_info.get('code_files', []):
-                    try:
-                        content = self.get_file_content(repo.full_name, file_info['path'])
-                        if content:
-                            files_content.append({
-                                'path': file_info['path'],
-                                'content': content,
-                                'last_modified': file_info.get('last_modified')
-                            })
-                    except Exception as e:
-                        self.logger.warning(f"Error getting content for {file_info['path']}: {str(e)}")
+            # Run analysis tasks concurrently
+            structure_info, dependencies, readme_content = await asyncio.gather(
+                self._analyze_repository_structure(repo, branch, path),
+                self._analyze_dependencies(repo, branch, path),
+                self._get_readme_content(repo, branch, path)
+            )
 
-                # Process files and generate embeddings
-                if files_content:
-                    await self.embeddings_manager.process_repository(repo_url, files_content)
+            # Update repo_info with results
+            repo_info.update(structure_info)
+            repo_info['dependencies'] = dependencies
+            if readme_content:
+                repo_info['readme'] = readme_content
 
-            # Add code relationships
+            # Process code relationships and generate embeddings
             if structure_info.get('code_files'):
-                code_relationships = self._analyze_code_relationships(repo, structure_info['code_files'])
-                repo_info['code_relationships'] = code_relationships
-
-            # Try to get dependency info
-            try:
-                dependencies = self._analyze_dependencies(repo)
-                repo_info['dependencies'] = dependencies
-            except Exception as e:
-                self.logger.warning(f"Error analyzing dependencies: {str(e)}")
-
-            # Try to get README
-            try:
-                readme_content = self._get_readme_content(repo)
-                if readme_content:
-                    repo_info['readme'] = readme_content
-            except Exception as e:
-                self.logger.warning(f"Error getting README: {str(e)}")
+                await self._process_code_files(repo_info, repo, structure_info['code_files'])
 
             self.logger.info("Repository analysis completed successfully")
             return repo_info
-            
+
         except Exception as e:
             self.logger.error(f"Error in repository analysis: {str(e)}")
             raise Exception(f"Error analyzing repository: {str(e)}")
+
+    async def _handle_branch_error(self, repo: Repository, branch: str, error: Exception):
+        """Handle branch verification errors"""
+        try:
+            branches = [b.name for b in repo.get_branches()]
+            if branch in branches:
+                self.logger.info(f"Branch {branch} exists but couldn't get details")
+            else:
+                self.logger.error(f"Branch {branch} not found in {branches}")
+                raise Exception(f"Branch {branch} not found in repository")
+        except Exception as branch_e:
+            self.logger.error(f"Error listing branches: {str(branch_e)}")
+            raise Exception(f"Could not verify branch {branch}")
+
+    async def _gather_basic_info(self, repo: Repository, branch: str, path: str) -> Dict:
+        """Gather basic repository information"""
+        return {
+            'name': repo.name,
+            'full_name': repo.full_name,
+            'description': repo.description,
+            'default_branch': repo.default_branch,
+            'current_branch': branch or repo.default_branch,
+            'current_path': path,
+            'stars': repo.stargazers_count,
+            'forks': repo.forks_count,
+            'last_updated': repo.updated_at.isoformat(),
+            'language': repo.language,
+            'topics': repo.get_topics(),
+            'visibility': 'private' if repo.private else 'public',
+            'size': repo.size,
+            'open_issues': repo.open_issues_count
+        }
+
+    async def _process_code_files(self, repo_info: Dict, repo: Repository, code_files: List[Dict]):
+        """Process code files for relationships and embeddings"""
+        # Analyze code relationships
+        code_relationships = await self._analyze_code_relationships(
+            repo, 
+            code_files,
+            self._current_commit_sha
+        )
+        repo_info['code_relationships'] = code_relationships
+
+        # Get file contents
+        file_contents = {}
+        files_for_embedding = []
+
+        for file_path in code_relationships['code_analysis'].keys():
+            try:
+                content = await self.tracked_get_contents(repo, file_path, self._current_commit_sha)
+                if content:
+                    decoded_content = base64.b64decode(content.content).decode('utf-8')
+                    file_contents[file_path] = decoded_content
+
+                    # Prepare for embedding
+                    files_for_embedding.append({
+                        'path': file_path,
+                        'content': decoded_content,
+                        'last_modified': repo_info['last_updated']
+                    })
+            except Exception as e:
+                self.logger.warning(f"Could not process content for {file_path}: {e}")
+
+        repo_info['file_contents'] = file_contents
+
+        # Generate embeddings if manager is available
+        if self.embeddings_manager and files_for_embedding:
+            try:
+                embedding_stats = await self.embeddings_manager.process_repository(
+                    repo_info['full_name'],
+                    files_for_embedding
+                )
+                repo_info['embedding_stats'] = embedding_stats
+                repo_info['embedded_files'] = len(files_for_embedding)
+            except Exception as e:
+                self.logger.error(f"Error generating embeddings: {str(e)}")
+                repo_info['embedding_error'] = str(e)
 
     def _analyze_repository_structure(self, repo) -> Dict:
         """Analyze the repository's file structure with debugging"""
@@ -262,3 +455,21 @@ class GitHubService:
             '.dart', '.vue', '.scala', '.r', '.jl'
         }
         return Path(path).suffix.lower() in code_extensions
+    
+    def get_retrieval_stats(self) -> Dict:
+        """Get statistics about content retrievals and embeddings"""
+        stats = {
+            'cache_entries': len(self._content_cache),
+            'paths_accessed': list(self._content_cache.keys()),
+            'timestamps': {k: v['time'] for k, v in self._content_cache.items()},
+            'shas': {k: v['sha'] for k, v in self._content_cache.items()}
+        }
+
+        if self.embeddings_manager:
+            try:
+                embedding_stats = self.embeddings_manager.get_stats()
+                stats['embedding_stats'] = embedding_stats
+            except Exception as e:
+                self.logger.warning(f"Could not get embedding stats: {e}")
+
+        return stats

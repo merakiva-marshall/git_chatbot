@@ -6,108 +6,150 @@ from config import AppConfig
 from chat_service import ChatService
 from github_service import GitHubService
 from utils.settings_manager import SettingsManager
+from utils.usage_tracker import UsageTracker
 import asyncio
 from vector_store.embeddings_manager import EmbeddingsManager
+import plotly.express as px
+import pandas as pd
+from datetime import datetime, timedelta
+from functools import partial
 
 # Load environment variables
 load_dotenv()
 
-# Available Claude models
 CLAUDE_MODELS = {
-    "Claude 3 Sonnet": "claude-3-sonnet-20240229",
-    "Claude 3 Haiku": "claude-3-haiku-20240307",
+    "Claude 3.5 Sonnet": "claude-3-5-sonnet-latest",
+    "Claude 3.5 Haiku": "claude-3-5-haiku-latest",
 }
 
-def analyze_repository_async(github_service: GitHubService, repo_url: str):
-    """Run async repository analysis"""
-    return asyncio.run(github_service.analyze_repository(repo_url))
+def run_async(coroutine):
+    """Helper function to run async functions in Streamlit"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coroutine)
 
 def init_services():
     """Initialize all required services"""
     config = AppConfig()
     anthropic_client = Anthropic(api_key=config.anthropic_api_key)
-    
+
     # Initialize embeddings manager
     embeddings_manager = EmbeddingsManager(anthropic_client)
-    
-    selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3 Sonnet"])
-    custom_instructions = st.session_state.get('custom_instructions', '')
-    
+
+    selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"])
+
     # Initialize services with embeddings manager
     chat_service = ChatService(
         anthropic_client,
         embeddings_manager=embeddings_manager,
         model=selected_model,
-        custom_instructions=custom_instructions
+        custom_instructions=st.session_state.get('custom_instructions', '')
     )
     github_service = GitHubService(config.github_token, embeddings_manager=embeddings_manager)
-    
+
     return config, chat_service, github_service
 
 def init_session_state(settings_manager: SettingsManager):
     """Initialize session state with saved settings"""
     settings = settings_manager.get_settings()
-    
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "current_repo" not in st.session_state:
-        st.session_state.current_repo = None
-    if "selected_model" not in st.session_state:
-        st.session_state.selected_model = settings.get('selected_model', CLAUDE_MODELS["Claude 3 Sonnet"])
-    if "custom_instructions" not in st.session_state:
-        st.session_state.custom_instructions = settings.get('custom_instructions', '')
-    if "last_repo" not in st.session_state:
-        st.session_state.last_repo = settings.get('last_repo', '')
+    defaults = {
+        "messages": [],
+        "current_repo": None,
+        "selected_model": settings.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"]),
+        "custom_instructions": settings.get('custom_instructions', ''),
+        "last_repo": settings.get('last_repo', ''),
+        "waiting_for_response": False,
+        "conversation_history": [],
+        "current_session_tokens": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_cost": 0.0,
+            "embedding_tokens": 0,
+            "embedding_cost": 0.0
+        },
+        "current_query_stats": None
+    }
 
-def handle_chat_input(prompt: str, chat_service: ChatService):
-    """Handle chat input with full debugging"""
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+def format_conversation_history():
+    """Format conversation history for the API"""
+    formatted_messages = []
+    for msg in st.session_state.conversation_history:
+        formatted_messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    return formatted_messages
+
+async def handle_chat_input(prompt: str, chat_service: ChatService):
+    """Handle chat input with embeddings support"""
     if not prompt.strip():
         return
-    
-    with st.sidebar.expander("🤖 Chat Debug", expanded=True):
-        st.write("Processing chat input...")
-        st.write(f"Prompt: {prompt}")
-        st.write(f"Model: {chat_service.model}")
-        st.write(f"Custom Instructions: {bool(chat_service.custom_instructions)}")
-        
-        if st.session_state.current_repo:
-            st.write("\nRepository Context:")
-            st.json(st.session_state.current_repo)
-    
-    # Display user message
+
     with st.chat_message("user"):
         st.markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
+
+    st.session_state.conversation_history.append({
+        "role": "user",
+        "content": prompt
+    })
+
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                # Get relevant code
+                messages = format_conversation_history()
+
+                # Get relevant code context using embeddings
+                relevant_code = None
                 if chat_service.embeddings_manager:
-                    relevant_code = asyncio.run(chat_service.embeddings_manager.search_code(prompt))
-                
-                # Generate response
-                response = asyncio.run(chat_service.generate_response(
-                    prompt,
-                    st.session_state.current_repo
-                ))
-                
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response
-                })
-                st.markdown(response)
+                    try:
+                        relevant_code = await chat_service.embeddings_manager.search_code(prompt)
+                    except Exception as e:
+                        st.warning(f"Error retrieving code context: {str(e)}")
+
+                try:
+                    response = await chat_service.generate_response(
+                        prompt,
+                        st.session_state.current_repo,
+                        messages=messages[:-1],
+                        code_context=relevant_code
+                    )
+
+                    if response:
+                        st.session_state.conversation_history.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+                        st.markdown(response)
+
+                        # Update session state with current query stats
+                        if chat_service.current_query_stats:
+                            st.session_state.current_query_stats = chat_service.current_query_stats
+                    else:
+                        st.error("No response received from the assistant")
+                except Exception as e:
+                    if "overloaded" in str(e).lower():
+                        st.error("The service is temporarily busy. Please wait a moment and try again.")
+                    else:
+                        st.error(f"Error: {str(e)}")
     except Exception as e:
-        st.error(f"Error generating response: {str(e)}")
+        st.error(f"Error: {str(e)}")
 
 def save_current_chat(settings_manager: SettingsManager):
-    """Save current chat session"""
-    if st.session_state.messages:
+    """Save current chat session with embedding context"""
+    if st.session_state.conversation_history:
         chat_title = st.session_state.get('chat_title', f"Chat {len(settings_manager.get_chat_sessions()) + 1}")
         filename = settings_manager.save_chat_session(
-            st.session_state.messages,
+            st.session_state.conversation_history,
             st.session_state.current_repo,
-            chat_title
+            chat_title,
+            embedding_stats=st.session_state.current_session_tokens.get('embedding_stats', {})
         )
         st.success(f"Chat saved as: {chat_title}")
 
@@ -117,20 +159,16 @@ def main():
         page_icon="💬",
         layout="wide"
     )
-    
+
     settings_manager = SettingsManager()
-    
+    init_session_state(settings_manager)
+
     st.title("Git Chatbot")
     st.caption("Chat with your GitHub repositories using Claude")
-    
-    # Initialize session state
-    init_session_state(settings_manager)
-    
-    # Sidebar for settings
+
     with st.sidebar:
         st.header("Settings")
-        
-        # Model selection
+
         selected_model_name = st.selectbox(
             "Select Claude Model",
             options=list(CLAUDE_MODELS.keys()),
@@ -140,7 +178,7 @@ def main():
         if new_model != st.session_state.selected_model:
             st.session_state.selected_model = new_model
             settings_manager.update_settings({"selected_model": new_model})
-        
+
         # Custom instructions
         st.header("Custom Instructions")
         custom_instructions = st.text_area(
@@ -151,7 +189,7 @@ def main():
         if custom_instructions != st.session_state.custom_instructions:
             st.session_state.custom_instructions = custom_instructions
             settings_manager.update_settings({"custom_instructions": custom_instructions})
-        
+
         # Repository settings
         st.header("Repository Settings")
         repo_url = st.text_input(
@@ -159,43 +197,167 @@ def main():
             value=st.session_state.last_repo,
             placeholder="https://github.com/username/repository"
         )
-        
+
         if repo_url != st.session_state.last_repo:
             st.session_state.last_repo = repo_url
             settings_manager.update_settings({"last_repo": repo_url})
-        
+
+        # Embedding settings
+        with st.expander("Embedding Settings", expanded=False):
+            st.checkbox("Enable Code Search", value=True, key="enable_embeddings",
+                       help="Use embeddings for semantic code search")
+            st.number_input("Max Results", min_value=1, max_value=10, value=5, key="max_embedding_results",
+                          help="Maximum number of code snippets to retrieve")
+
+            if st.button("Clear Embedding Cache"):
+                try:
+                    config, chat_service, _ = init_services()
+                    chat_service.embeddings_manager.clear_cache()
+                    st.success("Embedding cache cleared")
+                except Exception as e:
+                    st.error(f"Error clearing cache: {str(e)}")
+
         if st.button("Analyze Repository"):
             with st.spinner("Analyzing repository..."):
                 try:
                     _, _, github_service = init_services()
-                    repo_info = analyze_repository_async(github_service, repo_url)
+                    repo_info = run_async(github_service.analyze_repository(repo_url))
                     st.session_state.current_repo = repo_info
-                    
-                    # Enhanced success message
-                    st.success(f"""
-Repository analyzed successfully!
-- Name: {repo_info['name']}
-- Language: {repo_info.get('language', 'Not specified')}
-- Files in root: {repo_info.get('root_files', 0)}
-- Total files: {repo_info.get('total_files', 0)}
-- Directories: {len(repo_info.get('directories', []))}
-- Last updated: {repo_info.get('last_updated', 'Unknown')}
-                    """)
-                    
+
+                    # Enhanced success message with embeddings info
+                    success_msg = f"""
+                    Repository analyzed successfully!
+                    - Name: {repo_info['name']}
+                    - Branch: {repo_info.get('current_branch', 'default')}
+                    - Path: {repo_info.get('current_path', 'root')}
+                    - Language: {repo_info.get('language', 'Not specified')}
+                    - Files in scope: {repo_info.get('total_files', 0)}
+                    - Directories: {len(repo_info.get('directories', []))}
+                    - Last updated: {repo_info.get('last_updated', 'Unknown')}
+                    """
+
+                    if st.session_state.enable_embeddings:
+                        success_msg += f"\nEmbeddings generated for {repo_info.get('embedded_files', 0)} files"
+
+                    st.success(success_msg)
+
                     # Show additional info in expandable section
                     with st.expander("View Detailed Analysis"):
                         st.write("File Types:")
                         for ext, count in repo_info.get('file_types', {}).items():
                             st.write(f"- {ext}: {count} files")
-                        
+
                         if repo_info.get('dependencies', {}).get('package_json'):
                             st.write("📦 Found package.json (Node.js/JavaScript project)")
                         if repo_info.get('dependencies', {}).get('requirements_txt'):
                             st.write("📦 Found requirements.txt (Python project)")
-                            
+
+                        # Show embedding statistics
+                        if st.session_state.enable_embeddings:
+                            st.write("\nEmbedding Statistics:")
+                            embed_stats = repo_info.get('embedding_stats', {})
+                            st.write(f"- Total tokens used: {embed_stats.get('total_tokens', 0)}")
+                            st.write(f"- Embedding cost: ${embed_stats.get('cost', 0):.4f}")
+
                 except Exception as e:
                     st.error(f"Error analyzing repository: {str(e)}")
-        
+
+        # Usage Statistics Section
+        st.header("Usage Statistics")
+        tracker = UsageTracker()
+
+        now = datetime.now()
+        last_24h = (now - timedelta(days=1)).isoformat()
+
+        try:
+            daily_usage = tracker.get_usage_summary(start_date=last_24h)
+            total_usage = tracker.get_usage_summary()
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**Last 24 Hours**")
+                total_tokens = (daily_usage['total_input_tokens'] + 
+                              daily_usage['total_output_tokens'] +
+                              daily_usage.get('embedding_tokens', 0))
+                total_cost = (daily_usage['total_cost'] + 
+                            daily_usage.get('embedding_cost', 0))
+                st.metric("Tokens", f"{total_tokens:,}", f"${total_cost:.2f}")
+
+            with col2:
+                st.markdown("**All Time**")
+                all_time_tokens = (total_usage['total_input_tokens'] + 
+                                 total_usage['total_output_tokens'] +
+                                 total_usage.get('embedding_tokens', 0))
+                all_time_cost = (total_usage['total_cost'] + 
+                               total_usage.get('embedding_cost', 0))
+                st.metric("Tokens", f"{all_time_tokens:,}", f"${all_time_cost:.2f}")
+
+            # Detailed usage statistics
+            with st.expander("View Detailed Usage"):
+                cols = st.columns(2)
+                with cols[0]:
+                    start_date = st.date_input(
+                        "Start Date",
+                        value=now - timedelta(days=7),
+                        key="usage_start_date"
+                    )
+                with cols[1]:
+                    end_date = st.date_input(
+                        "End Date",
+                        value=now,
+                        key="usage_end_date"
+                    )
+
+                custom_usage = tracker.get_usage_summary(
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat()
+                )
+
+                if custom_usage['usage_by_model']:
+                    model_data = []
+                    for model, stats in custom_usage['usage_by_model'].items():
+                        model_data.append({
+                            'Model': model,
+                            'Input': stats['input_tokens'],
+                            'Output': stats['output_tokens'],
+                            'Embeddings': stats.get('embedding_tokens', 0),
+                            'Cost': f"${stats['cost'] + stats.get('embedding_cost', 0):.2f}"
+                        })
+
+                    df = pd.DataFrame(model_data)
+                    st.dataframe(df, hide_index=True)
+
+                    # Create visualization
+                    df_melted = pd.melt(
+                        df,
+                        id_vars=['Model'],
+                        value_vars=['Input', 'Output', 'Embeddings'],
+                        var_name='Type',
+                        value_name='Tokens'
+                    )
+
+                    fig = px.bar(
+                        df_melted,
+                        x='Model',
+                        y='Tokens',
+                        color='Type',
+                        barmode='group',
+                        title='Token Usage by Model and Type'
+                    )
+
+                    fig.update_layout(
+                        height=300,
+                        margin=dict(t=30, l=30, r=30, b=30),
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No usage data available for the selected date range.")
+
+        except Exception as e:
+            st.error(f"Error loading usage statistics: {str(e)}")
+
         # Chat session management
         st.header("Chat Sessions")
         chat_title = st.text_input(
@@ -204,12 +366,12 @@ Repository analyzed successfully!
             placeholder="Enter a title for this chat session"
         )
         st.session_state.chat_title = chat_title
-        
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Save Chat"):
                 save_current_chat(settings_manager)
-        
+
         # Load previous chats
         chat_sessions = settings_manager.get_chat_sessions()
         if chat_sessions:
@@ -222,35 +384,24 @@ Repository analyzed successfully!
                 if st.button("Load Chat"):
                     chat_data = settings_manager.load_chat_session(selected_chat['id'])
                     if chat_data:
-                        st.session_state.messages = chat_data['messages']
+                        st.session_state.conversation_history = chat_data['messages']
                         st.session_state.current_repo = chat_data['repo_info']
                         st.session_state.chat_title = chat_data.get('title', '')
                         st.rerun()
-    
+
     # Chat interface
     chat_container = st.container()
-    
+
     # Display chat history
     with chat_container:
-        for message in st.session_state.messages:
+        for message in st.session_state.conversation_history:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-    
+
     # Chat input
     if prompt := st.chat_input("Ask about the repository...", key="chat_input"):
-        # Initialize services with embeddings manager
-        config = AppConfig()
-        anthropic_client = Anthropic(api_key=config.anthropic_api_key)
-        embeddings_manager = EmbeddingsManager(anthropic_client)
-        
-        chat_service = ChatService(
-            anthropic_client,
-            embeddings_manager=embeddings_manager,
-            model=st.session_state.selected_model,
-            custom_instructions=st.session_state.custom_instructions
-        )
-        
-        handle_chat_input(prompt, chat_service)
+        config, chat_service, _ = init_services()
+        run_async(handle_chat_input(prompt, chat_service))
 
 if __name__ == "__main__":
     main()
