@@ -12,14 +12,23 @@ import os
 import streamlit as st 
 
 class EmbeddingsManager:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(EmbeddingsManager, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self, anthropic_client: Anthropic, cache_dir: str = "data/embeddings_cache"):
-        self.anthropic_client = anthropic_client
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.qdrant = QdrantManager()
-        self.processor = CodeProcessor()
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.logger = logging.getLogger(__name__)
+        if not hasattr(self, 'initialized'):
+            self.anthropic_client = anthropic_client
+            self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            self.qdrant = QdrantManager()
+            self.processor = CodeProcessor()
+            self.cache_dir = Path(cache_dir)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.logger = logging.getLogger(__name__)
+            self.initialized = True
 
     async def process_repository(self, repo_url: str, files: List[Dict]) -> None:
         """Process repository files and generate embeddings"""

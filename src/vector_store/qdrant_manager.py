@@ -11,93 +11,81 @@ from pathlib import Path
 import json
 
 class QdrantManager:
+    _instance = None
+    _client = None
+    _lock = asyncio.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(QdrantManager, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self, 
                  path: str = "data/qdrant",
                  collection_name: str = "code_vectors",
-                 vector_size: int = 1536):  # OpenAI's embedding size
-        """Initialize Qdrant manager with support for concurrent operations"""
-        self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
+                 vector_size: int = 1536):
+        if not hasattr(self, 'initialized'):
+            self.path = Path(path)
+            self.path.mkdir(parents=True, exist_ok=True)
+            self.collection_name = collection_name
+            self.vector_size = vector_size
+            self.logger = logging.getLogger(__name__)
 
-        self.collection_name = collection_name
-        self.vector_size = vector_size
-        self.logger = logging.getLogger(__name__)
+            # Initialize client only if it doesn't exist
+            if QdrantManager._client is None:
+                QdrantManager._client = QdrantClient(path=str(self.path))
 
-        # Initialize client
-        self.client = QdrantClient(path=str(self.path))
+            # Setup concurrency control
+            self._setup_concurrency()
 
-        # Setup concurrency control
-        self._setup_concurrency()
+            # Initialize collection
+            self._init_collection()
 
-        # Initialize collection
-        self._init_collection()
+            self.initialized = True
+
+    @property
+    def client(self):
+        return QdrantManager._client
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        if QdrantManager._client is not None:
+            QdrantManager._client.close()
+            QdrantManager._client = None
 
     def _setup_concurrency(self):
         """Setup concurrency controls"""
         self._write_lock = asyncio.Lock()
         self._read_lock = asyncio.Lock()
-        self._operation_semaphore = asyncio.Semaphore(10)  # Limit concurrent operations
+        self._operation_semaphore = asyncio.Semaphore(10)
 
     def _init_collection(self):
-        """Initialize vector collection with error handling"""
-        try:
-            # Check if collection exists
-            collections = self.client.get_collections()
-            existing_collections = [c.name for c in collections.collections]
+        """Initialize vector collection with error handling and recovery"""
+        max_retries = 3
+        retry_delay = 2
 
-            if self.collection_name not in existing_collections:
-                self.logger.info(f"Creating collection: {self.collection_name}")
+        for attempt in range(max_retries):
+            try:
+                collections = self.client.get_collections()
+                existing_collections = [c.name for c in collections.collections]
 
-                # Create collection with optimized settings
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=models.VectorParams(
-                        size=self.vector_size,
-                        distance=models.Distance.COSINE
-                    ),
-                    optimizers_config=models.OptimizersConfigDiff(
-                        indexing_threshold=20000,  # Optimize for larger datasets
-                        memmap_threshold=50000
-                    ),
-                    hnsw_config=models.HnswConfigDiff(
-                        m=16,  # Number of connections per element
-                        ef_construct=100  # Size of the beam search
+                if self.collection_name not in existing_collections:
+                    self.logger.info(f"Creating collection: {self.collection_name}")
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=models.VectorParams(
+                            size=self.vector_size,
+                            distance=models.Distance.COSINE
+                        )
                     )
-                )
-
-                # Create necessary indexes
-                self._create_indexes()
-            else:
-                self.logger.info(f"Collection {self.collection_name} already exists")
-
-        except Exception as e:
-            self.logger.error(f"Error initializing collection: {str(e)}")
-            raise
-
-    def _create_indexes(self):
-        """Create necessary indexes for efficient searching"""
-        try:
-            # Create payload indexes for common fields
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="file_path",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
-
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="code_type",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
-
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="last_modified",
-                field_schema=models.PayloadSchemaType.DATETIME
-            )
-
-        except Exception as e:
-            self.logger.warning(f"Error creating indexes: {str(e)}")
+                    self._create_indexes()
+                return
+            except Exception as e:
+                self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    asyncio.sleep(retry_delay * (attempt + 1))
+                else:
+                    raise
 
     async def store_code_vectors(self,
                                embeddings: List[np.ndarray],

@@ -21,42 +21,33 @@ class ChatService:
         self.client = anthropic_client
         self.model = model
         self.custom_instructions = custom_instructions
+        self.embeddings_manager = embeddings_manager
         self.conversation_history = []
         self.usage_tracker = UsageTracker()
         self.token_counter = TokenCounter(model)
         self.conversation_id = str(uuid4())
         self.current_query_stats = None
-        self.embeddings_manager = embeddings_manager
 
         # Internal state
         self._last_repo_info = None
         self._last_request_time = 0
         self._request_lock = asyncio.Lock()
 
+        # Initialize logger
+        self.logger = logging.getLogger(__name__)
         self._setup_logging()
 
     def _setup_logging(self):
-        """Initialize logging"""
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-
-    def _build_full_prompt(self, prompt: str, context: str = "", code_context: List[Dict] = None) -> str:
-        """Combine context with prompt and code context"""
-        parts = []
-
-        if code_context:
-            parts.append("Relevant code context:")
-            for ctx in code_context:
-                parts.append(f"File: {ctx.get('file', 'unknown')}")
-                parts.append(f"Type: {ctx.get('type', 'unknown')}")
-                parts.append(f"Content:\n{ctx.get('content', '')}\n")
-
-        if context:
-            parts.append(f"Context:\n{context}")
-
-        parts.append(f"Question: {prompt}")
-
-        return "\n\n".join(parts)
+        """Initialize logging configuration"""
+        # Configure logging if not already configured
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
 
     async def generate_response(self, 
                               prompt: str, 
@@ -68,9 +59,17 @@ class ChatService:
             # Track repository info changes
             if repo_info != self._last_repo_info:
                 self.logger.info("Repository info changed from previous request")
-                self.logger.info(f"New branch: {repo_info.get('current_branch')}")
-                self.logger.info(f"New path: {repo_info.get('current_path')}")
                 self._last_repo_info = repo_info.copy() if repo_info else None
+
+            # Get relevant code context using embeddings
+            if self.embeddings_manager:
+                try:
+                    relevant_code = await self.embeddings_manager.search_code(prompt)
+                    if relevant_code:
+                        code_context = relevant_code
+                except Exception as e:
+                    self.logger.warning(f"Error retrieving code context: {str(e)}")
+                    # Continue without code context if there's an error
 
             async with self._request_lock:
                 # Implement rate limiting
@@ -95,10 +94,6 @@ class ChatService:
                 "content": prompt
             })
 
-            # Count input tokens
-            input_content = str(api_messages) + system_prompt
-            input_tokens = self.token_counter.count_tokens(input_content)
-
             # Create the message using the sync API
             max_retries = 3
             retry_delay = 2
@@ -113,36 +108,11 @@ class ChatService:
                     )
 
                     output_content = response.content[0].text
-                    output_tokens = self.token_counter.count_tokens(output_content)
 
-                    # Track regular API usage
-                    usage_record = self.usage_tracker.track_usage(
-                        input_content=input_content,
-                        output_content=output_content,
-                        model=self.model,
-                        conversation_id=self.conversation_id
-                    )
-
-                    # Include embedding tokens in stats if available
-                    embedding_tokens = 0
-                    embedding_cost = 0
-                    if code_context:
-                        embedding_tokens = sum(self.token_counter.count_tokens(ctx.get('content', '')) 
-                                            for ctx in code_context)
-                        embedding_cost = self.token_counter.estimate_cost(embedding_tokens, 0)
-
-                    # Store current query stats
-                    self.current_query_stats = {
-                        'input_tokens': usage_record.input_tokens,
-                        'output_tokens': usage_record.output_tokens,
-                        'total_tokens': usage_record.input_tokens + usage_record.output_tokens,
-                        'estimated_cost': usage_record.cost,
-                        'embedding_tokens': embedding_tokens,
-                        'embedding_cost': embedding_cost
-                    }
-
+                    # Update last request time
                     self._last_request_time = time.time()
-                    return response.content[0].text
+
+                    return output_content
 
                 except Exception as e:
                     if "overloaded" in str(e).lower() and attempt < max_retries - 1:
@@ -154,7 +124,7 @@ class ChatService:
 
         except Exception as e:
             self.logger.error(f"Error generating response: {str(e)}")
-            raise Exception(f"Error generating response: {str(e)}")
+            raise
 
     def _build_system_prompt(self, repo_info: Optional[Dict], code_context: Optional[List[Dict]] = None) -> str:
         """Build detailed system prompt with repository information and code context"""

@@ -9,10 +9,12 @@ from utils.settings_manager import SettingsManager
 from utils.usage_tracker import UsageTracker
 import asyncio
 from vector_store.embeddings_manager import EmbeddingsManager
+from vector_store.qdrant_manager import QdrantManager
 import plotly.express as px
 import pandas as pd
 from datetime import datetime, timedelta
 from functools import partial
+import atexit
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +23,21 @@ CLAUDE_MODELS = {
     "Claude 3.5 Sonnet": "claude-3-5-sonnet-latest",
     "Claude 3.5 Haiku": "claude-3-5-haiku-latest",
 }
+
+def cleanup_resources():
+    """Cleanup resources on application exit"""
+    try:
+        # Get the QdrantManager instance and clean up
+        qdrant_manager = QdrantManager()
+        asyncio.run(qdrant_manager.cleanup())
+    except Exception as e:
+        st.error(f"Error cleaning up resources: {str(e)}")
+
+# Register cleanup function
+    atexit.register(cleanup_resources)
+
+# Register cleanup function
+atexit.register(cleanup_resources)
 
 def run_async(coroutine):
     """Helper function to run async functions in Streamlit"""
@@ -36,7 +53,7 @@ def init_services():
     config = AppConfig()
     anthropic_client = Anthropic(api_key=config.anthropic_api_key)
 
-    # Initialize embeddings manager
+    # Initialize embeddings manager (singleton)
     embeddings_manager = EmbeddingsManager(anthropic_client)
 
     selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"])
@@ -221,8 +238,18 @@ def main():
             with st.spinner("Analyzing repository..."):
                 try:
                     _, _, github_service = init_services()
+
+                    # Add debug information
+                    st.write("Initializing repository analysis...")
+                    st.write(f"Repository URL: {repo_url}")
+
                     repo_info = run_async(github_service.analyze_repository(repo_url))
-                    st.session_state.current_repo = repo_info
+
+                    # Debug output
+                    st.write("\nDebug Information:")
+                    st.write(f"Files found: {repo_info.get('total_files', 0)}")
+                    st.write(f"File types: {repo_info.get('file_types', {})}")
+                    st.write(f"Directories: {len(repo_info.get('directories', []))}")
 
                     # Enhanced success message with embeddings info
                     success_msg = f"""
@@ -261,6 +288,9 @@ def main():
 
                 except Exception as e:
                     st.error(f"Error analyzing repository: {str(e)}")
+                    st.write("Debug information:")
+                    st.write(f"Exception type: {type(e).__name__}")
+                    st.write(f"Exception details: {str(e)}")
 
         # Usage Statistics Section
         st.header("Usage Statistics")
