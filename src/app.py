@@ -8,6 +8,10 @@ from github_service import GitHubService
 from utils.settings_manager import SettingsManager
 import asyncio
 from functools import partial
+from utils.usage_tracker import UsageTracker
+import plotly.express as px  # Change this import
+import pandas as pd
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -47,9 +51,15 @@ def init_session_state(settings_manager: SettingsManager):
         "custom_instructions": settings.get('custom_instructions', ''),
         "last_repo": settings.get('last_repo', ''),
         "waiting_for_response": False,
-        "conversation_history": []
+        "conversation_history": [],
+        "current_session_tokens": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_cost": 0.0,
+        "current_query_stats": None
+        }
     }
-    
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -85,13 +95,17 @@ def handle_chat_input(prompt: str, chat_service: ChatService):
                         st.session_state.current_repo,
                         messages=messages[:-1]
                     ))
-                    
+
                     if response:
                         st.session_state.conversation_history.append({
                             "role": "assistant",
                             "content": response
                         })
                         st.markdown(response)
+
+                        # Update session state with current query stats AFTER response
+                        if chat_service.current_query_stats:
+                            st.session_state.current_query_stats = chat_service.current_query_stats
                     else:
                         st.error("No response received from the assistant")
                 except Exception as e:
@@ -243,6 +257,129 @@ def main():
                         st.session_state.current_repo = chat_data['repo_info']
                         st.session_state.chat_title = chat_data.get('title', '')
                         st.rerun()
+        # Add a divider before usage stats
+            st.divider()
+
+            # Usage Statistics Section
+            st.header("Usage Statistics")
+
+            tracker = UsageTracker()
+
+            # Get usage for last 24 hours and all time
+            now = datetime.now()
+            last_24h = (now - timedelta(days=1)).isoformat()
+
+            try:
+                # Get usage summaries
+                daily_usage = tracker.get_usage_summary(start_date=last_24h)
+                total_usage = tracker.get_usage_summary()
+
+                # Create two columns for the metrics
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Last 24 Hours**")
+                    st.metric(
+                        "Tokens",
+                        f"{daily_usage['total_input_tokens'] + daily_usage['total_output_tokens']:,}",
+                        f"${daily_usage['total_cost']:.2f}"
+                    )
+
+                with col2:
+                    st.markdown("**All Time**")
+                    st.metric(
+                        "Tokens",
+                        f"{total_usage['total_input_tokens'] + total_usage['total_output_tokens']:,}",
+                        f"${total_usage['total_cost']:.2f}"
+                    )
+
+                # Show detailed statistics in an expander
+                with st.expander("View Detailed Usage"):
+                    # Date range selection
+                    cols = st.columns(2)
+                    with cols[0]:
+                        start_date = st.date_input(
+                            "Start Date",
+                            value=now - timedelta(days=7),
+                            key="usage_start_date"
+                        )
+                    with cols[1]:
+                        end_date = st.date_input(
+                            "End Date",
+                            value=now,
+                            key="usage_end_date"
+                        )
+
+                    # Get custom range usage
+                    custom_usage = tracker.get_usage_summary(
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat()
+                    )
+
+                    if custom_usage['usage_by_model']:
+                        # Create DataFrame for model usage
+                        model_data = []
+                        for model, stats in custom_usage['usage_by_model'].items():
+                            model_data.append({
+                                'Model': model,
+                                'Input': stats['input_tokens'],
+                                'Output': stats['output_tokens'],
+                                'Cost': f"${stats['cost']:.2f}"
+                            })
+
+                        df = pd.DataFrame(model_data)
+                        st.dataframe(df, hide_index=True)
+
+                        # Create bar chart using plotly express
+                        df_melted = pd.melt(
+                            df, 
+                            id_vars=['Model'], 
+                            value_vars=['Input', 'Output'],
+                            var_name='Type',
+                            value_name='Tokens'
+                        )
+
+                        fig = px.bar(
+                            df_melted,
+                            x='Model',
+                            y='Tokens',
+                            color='Type',
+                            barmode='group',
+                            title='Token Usage by Model'
+                        )
+
+                        fig.update_layout(
+                            height=300,
+                            margin=dict(t=30, l=30, r=30, b=30),
+                        )
+
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No usage data available for the selected date range.")
+
+                if st.button("Refresh Usage Stats", key="refresh_usage"):
+                    st.rerun()
+                
+
+                # Add a divider before current query stats
+                st.divider()
+
+                # Current Query Stats
+                st.header("Current Query Stats")
+                if st.session_state.get('current_query_stats'):
+                    stats = st.session_state.current_query_stats
+                    cols = st.columns(2)
+                    cols[0].metric("Input Tokens", f"{stats['input_tokens']:,}")
+                    cols[1].metric("Output Tokens", f"{stats['output_tokens']:,}")
+                    cols = st.columns(2)
+                    cols[0].metric("Total Tokens", f"{stats['total_tokens']:,}")
+                    cols[1].metric("Cost", f"${stats['estimated_cost']:.4f}")
+                else:
+                    st.info("No query statistics available yet")
+
+            except Exception as e:
+                st.error(f"Error loading usage statistics: {str(e)}")
+        
     
     # Chat interface
     chat_container = st.container()

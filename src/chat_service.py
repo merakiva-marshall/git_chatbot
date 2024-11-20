@@ -3,6 +3,8 @@ from typing import Dict, Optional, List
 import logging
 import asyncio
 import time
+from utils.usage_tracker import UsageTracker
+from uuid import uuid4
 
 MAX_TOKENS = 8192
 TEMPERATURE = 0.8
@@ -16,6 +18,9 @@ class ChatService:
         self.model = model
         self.custom_instructions = custom_instructions
         self.conversation_history = []
+        self.usage_tracker = UsageTracker()
+        self.conversation_id = str(uuid4())  # Generate unique conversation ID
+        self.current_query_stats = None
         
         # Internal state
         self._last_repo_info = None  # Add before setup_logging
@@ -53,42 +58,65 @@ class ChatService:
                 if time_since_last_request < MIN_REQUEST_INTERVAL:
                     await asyncio.sleep(MIN_REQUEST_INTERVAL - time_since_last_request)
 
-                system_prompt = self._build_system_prompt(repo_info)
+            # Build the full prompt
+            system_prompt = self._build_system_prompt(repo_info)
 
             # Format messages for the API
-                api_messages = []
-                if messages:
-                    api_messages.extend([
-                        {"role": msg["role"], "content": msg["content"]}
-                        for msg in messages
-                    ])
-                
-                api_messages.append({
-                    "role": "user",
-                    "content": prompt
-                })
+            api_messages = []
+            if messages:
+                api_messages.extend([
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in messages
+                ])
 
-                # Create the message using the sync API
-                max_retries = 3
-                retry_delay = 2
-                
-                for attempt in range(max_retries):
-                    try:
-                        response = self.client.messages.create(
-                            model=self.model,
-                            max_tokens=MAX_TOKENS,
-                            messages=api_messages,
-                            system=system_prompt
-                        )
-                        self._last_request_time = time.time()
-                        return response.content[0].text
-                    except Exception as e:
-                        if "overloaded" in str(e).lower() and attempt < max_retries - 1:
-                            wait_time = retry_delay * (attempt + 1)
-                            self.logger.warning(f"API overloaded, waiting {wait_time} seconds...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        raise
+            api_messages.append({
+                "role": "user",
+                "content": prompt
+            })
+
+            input_content = str(api_messages) + system_prompt
+
+            # Create the message using the sync API
+            max_retries = 3
+            retry_delay = 2
+
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=MAX_TOKENS,
+                        messages=api_messages,
+                        system=system_prompt
+                    )
+
+                    output_content = response.content[0].text
+
+                    # Track usage
+                    usage_record = self.usage_tracker.track_usage(
+                        input_content=input_content,
+                        output_content=output_content,
+                        model=self.model,
+                        conversation_id=self.conversation_id
+                    )
+
+                    # Store current query stats
+                    self.current_query_stats = {
+                        'input_tokens': usage_record.input_tokens,
+                        'output_tokens': usage_record.output_tokens,
+                        'total_tokens': usage_record.input_tokens + usage_record.output_tokens,
+                        'estimated_cost': usage_record.cost
+                    }
+
+                    self._last_request_time = time.time()
+                    return response.content[0].text
+
+                except Exception as e:
+                    if "overloaded" in str(e).lower() and attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        self.logger.warning(f"API overloaded, waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
 
         except Exception as e:
             self.logger.error(f"Error generating response: {str(e)}")
