@@ -1,3 +1,4 @@
+import streamlit as st
 from github import Github
 from typing import Dict, List, Optional, Tuple, Union, Any
 from urllib.parse import urlparse, unquote
@@ -259,6 +260,18 @@ URL Parsing Details:
                     )
                     repo_info['embedding_stats'] = embedding_stats
                     repo_info['embedded_files'] = len(files)
+
+                    # Add verification step here
+                    try:
+                        test_query = "main function"
+                        results = await self.embeddings_manager.search_code(test_query)
+                        if not results:
+                            st.warning("⚠️ No embeddings found in test query. Repository content may not be fully indexed.")
+                        else:
+                            st.success(f"✅ Repository indexed successfully with {len(results)} matching results for test query")
+                    except Exception as e:
+                        st.error(f"Error verifying embeddings: {str(e)}")
+
                 except Exception as e:
                     self.logger.error(f"Error processing embeddings: {str(e)}")
                     repo_info['embedding_error'] = str(e)

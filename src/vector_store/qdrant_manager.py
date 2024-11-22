@@ -1,14 +1,15 @@
+import streamlit as st
+import uuid
+import json
+from datetime import datetime
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
-from typing import Dict, List, Optional, Union
-import numpy as np
-from datetime import datetime
-import uuid
+from pathlib import Path
 import logging
 import asyncio
-from pathlib import Path
-import json
+from typing import Dict, List, Optional, Union
 
 class QdrantManager:
     _instance = None
@@ -87,47 +88,48 @@ class QdrantManager:
                 else:
                     raise
 
-    async def store_code_vectors(self,
-                               embeddings: List[np.ndarray],
-                               metadata: List[Dict],
-                               batch_size: int = 100) -> None:
+    async def store_code_vectors(self, embeddings: List[np.ndarray], metadata: List[Dict]) -> None:
         """Store code embeddings with batching and concurrency control"""
         async with self._write_lock:
             try:
-                # Process in batches
-                for i in range(0, len(embeddings), batch_size):
-                    batch_embeddings = embeddings[i:i + batch_size]
-                    batch_metadata = metadata[i:i + batch_size]
+                points = []
+                for embedding, meta in zip(embeddings, metadata):
+                    # Debug what we're storing
+                    st.write(f"""
+                    🔍 Storing vector for:
+                    📄 File: {meta.get('file', 'unknown')}
+                    💡 Type: {meta.get('code_type', 'unknown')}
+                    📝 Has content: {'raw_content' in meta}
+                    📊 Content length: {len(meta.get('raw_content', ''))}
+                    """)
 
-                    points = []
-                    for embedding, meta in zip(batch_embeddings, batch_metadata):
-                        # Generate a deterministic ID based on content
-                        content_hash = str(hash(meta.get('content', '')))
-                        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, content_hash))
+                    content_hash = str(hash(meta.get('file', '') + meta.get('raw_content', '')))
+                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, content_hash))
 
-                        points.append(models.PointStruct(
-                            id=point_id,
-                            vector=embedding.tolist(),
-                            payload={
-                                'file_path': meta.get('file_path', ''),
-                                'code_type': meta.get('code_type', ''),
-                                'content': meta.get('content', ''),
-                                'language': meta.get('language', ''),
-                                'last_modified': meta.get('last_modified', ''),
-                                'metadata': meta
-                            }
-                        ))
+                    point_payload = {
+                        'file_path': meta.get('file', ''),
+                        'code_type': meta.get('code_type', ''),
+                        'content': meta.get('raw_content', ''),
+                        'type': meta.get('type', ''),
+                        'metadata': meta
+                    }
 
-                    async with self._operation_semaphore:
-                        self.client.upsert(
-                            collection_name=self.collection_name,
-                            points=points
-                        )
+                    # Debug the payload (excluding actual content)
+                    st.write("📦 Payload keys:", list(point_payload.keys()))
 
-                    self.logger.info(f"Stored batch of {len(points)} vectors")
+                    points.append(models.PointStruct(
+                        id=point_id,
+                        vector=embedding.tolist(),
+                        payload=point_payload
+                    ))
+
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points
+                )
 
             except Exception as e:
-                self.logger.error(f"Error storing vectors: {str(e)}")
+                st.error(f"Error storing vectors: {str(e)}")
                 raise
 
     async def search_code(self,
