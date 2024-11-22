@@ -1,6 +1,6 @@
 import streamlit as st
 from github import Github
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 import logging
@@ -10,16 +10,23 @@ import re
 from github.Repository import Repository
 from github.ContentFile import ContentFile
 import time
-from vector_store.embeddings_manager import EmbeddingsManager
+from src.core.codebase_structure import CodebaseStructure
+from src.analysis.code_analyzer import CodeAnalyzer
+from src.embedding.hierarchical_embedder import HierarchicalEmbedding
 
 class GitHubService:
-    def __init__(self, github_token: str, embeddings_manager: Optional[EmbeddingsManager] = None):
+    def __init__(self, 
+                 github_token: str,
+                 codebase: CodebaseStructure,
+                 code_analyzer: CodeAnalyzer,
+                 hierarchical_embedder: HierarchicalEmbedding):
         self.client = Github(github_token)
         self.logger = self._setup_logging()
-        self._content_cache = {}  # Track content retrievals
-        self._current_commit_sha = None  # Track current commit SHA
-        self.embeddings_manager = embeddings_manager
-        self._setup_rate_limiting()
+        self.codebase = codebase
+        self.code_analyzer = code_analyzer
+        self.embedder = hierarchical_embedder
+        self._content_cache = {}
+        self._current_commit_sha = None
 
     def _setup_logging(self) -> logging.Logger:
         """Initialize logging"""
@@ -174,51 +181,31 @@ URL Parsing Details:
         return repo_full_name, branch, path
 
     async def analyze_repository(self, repo_url: str) -> Dict:
-        """Analyze a GitHub repository comprehensively with embedding support"""
+        """Analyze a GitHub repository with enhanced context"""
         self.logger.info(f"Starting analysis of repository: {repo_url}")
-        self._content_cache.clear()  # Clear cache on new analysis
+        self._content_cache.clear()
 
         try:
             # Parse the GitHub URL
             repo_full_name, branch, path = self._parse_github_url(repo_url)
-            self.logger.info(f"Parsed repo: {repo_full_name}, branch: {branch}, path: {path}")
-
             repo = self.client.get_repo(repo_full_name)
 
-            # Add debug logging
-            self.logger.info(f"Repository information:")
-            self.logger.info(f"Default branch: {repo.default_branch}")
-            self.logger.info(f"Size: {repo.size}kb")
-            self.logger.info(f"Language: {repo.language}")
+            # Get repository structure
+            files = await self._get_repository_files(repo, branch, path)
 
-            # Get all files recursively
-            files = []
-            if not branch:
-                branch = repo.default_branch
+            # Analyze code with new analyzer
+            for file_info in files:
+                analysis_result = await self.code_analyzer.analyze_file(
+                    Path(file_info['path']),
+                    file_info['content']
+                )
 
-            try:
-                contents = repo.get_contents("", ref=branch)
-                while contents:
-                    file_content = contents.pop(0)
-                    if file_content.type == "dir":
-                        contents.extend(repo.get_contents(file_content.path, ref=branch))
-                    else:
-                        try:
-                            decoded_content = base64.b64decode(file_content.content).decode('utf-8')
-                            files.append({
-                                'path': file_content.path,
-                                'content': decoded_content,
-                                'size': file_content.size,
-                                'type': Path(file_content.path).suffix,
-                                'last_modified': file_content.last_modified
-                            })
-                            self.logger.info(f"Added file: {file_content.path}")
-                        except Exception as e:
-                            self.logger.warning(f"Could not decode {file_content.path}: {str(e)}")
-                            continue
-            except Exception as e:
-                self.logger.error(f"Error getting contents: {str(e)}")
-                raise
+                # Add analyzed components to codebase
+                for component in analysis_result.components:
+                    self.codebase.add_component(component)
+
+            # Generate embeddings
+            embeddings = await self.embedder.embed_codebase(self.codebase)
 
             # Create repository info
             repo_info = {
@@ -226,62 +213,25 @@ URL Parsing Details:
                 'full_name': repo.full_name,
                 'description': repo.description,
                 'language': repo.language,
-                'current_branch': branch,
+                'current_branch': branch or repo.default_branch,
                 'current_path': path,
                 'last_updated': repo.updated_at.isoformat(),
                 'total_files': len(files),
-                'file_types': {},
-                'directories': set(),
-                'file_contents': {}
+                'file_types': self._count_file_types(files),
+                'directories': list(set(str(Path(f['path']).parent) for f in files)),
+                'embedding_stats': {
+                    'total_embeddings': len(embeddings),
+                    'by_type': {
+                        k: len(v) for k, v in embeddings.items()
+                    }
+                }
             }
-
-            # Process files
-            for file in files:
-                # Track file types
-                ext = Path(file['path']).suffix
-                repo_info['file_types'][ext] = repo_info['file_types'].get(ext, 0) + 1
-
-                # Track directories
-                dir_path = str(Path(file['path']).parent)
-                if dir_path != '.':
-                    repo_info['directories'].add(dir_path)
-
-                # Store file contents
-                repo_info['file_contents'][file['path']] = file['content']
-
-            repo_info['directories'] = list(repo_info['directories'])
-
-            # Process embeddings if manager is available
-            if self.embeddings_manager and files:
-                try:
-                    embedding_stats = await self.embeddings_manager.process_repository(
-                        repo.full_name,
-                        files
-                    )
-                    repo_info['embedding_stats'] = embedding_stats
-                    repo_info['embedded_files'] = len(files)
-
-                    # Add verification step here
-                    try:
-                        test_query = "main function"
-                        results = await self.embeddings_manager.search_code(test_query)
-                        if not results:
-                            st.warning("⚠️ No embeddings found in test query. Repository content may not be fully indexed.")
-                        else:
-                            st.success(f"✅ Repository indexed successfully with {len(results)} matching results for test query")
-                    except Exception as e:
-                        st.error(f"Error verifying embeddings: {str(e)}")
-
-                except Exception as e:
-                    self.logger.error(f"Error processing embeddings: {str(e)}")
-                    repo_info['embedding_error'] = str(e)
 
             return repo_info
 
         except Exception as e:
             self.logger.error(f"Error in repository analysis: {str(e)}")
             raise
-
     async def _handle_branch_error(self, repo: Repository, branch: str, error: Exception):
         """Handle branch verification errors"""
         try:

@@ -2,22 +2,34 @@ import streamlit as st
 from anthropic import Anthropic
 import os
 from dotenv import load_dotenv
-from config import AppConfig
-from chat_service import ChatService
+from config import AppConfig  # Changed from src.config
+from chat_service import ChatService  # Changed from src.chat_service
 from github_service import GitHubService
 from utils.settings_manager import SettingsManager
 from utils.usage_tracker import UsageTracker
 import asyncio
-from vector_store.embeddings_manager import EmbeddingsManager
-from vector_store.qdrant_manager import QdrantManager
+from embedding.hierarchical_embedder import HierarchicalEmbedding
+from embedding.contextual_embedder import ContextualEmbedder
+from storage.vector_store import CodebaseVectorStore
+from storage.context_store import ContextStorage
+from query.query_analyzer import QueryAnalyzer
+from query.contextual_search import ContextualSearch
+from core.codebase_structure import CodebaseStructure
+from analysis.code_analyzer import CodeAnalyzer
 import plotly.express as px
 import pandas as pd
 from datetime import datetime, timedelta
 from functools import partial
 import atexit
+from qdrant_client import QdrantClient
 
 # Load environment variables
 load_dotenv()
+
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.messages = []
+    st.session_state.current_repo = None
 
 CLAUDE_MODELS = {
     "Claude 3.5 Sonnet": "claude-3-5-sonnet-latest",
@@ -48,24 +60,93 @@ def run_async(coroutine):
         asyncio.set_event_loop(loop)
     return loop.run_until_complete(coroutine)
 
+def initialize_system():
+    """Initialize all system components"""
+    if 'system_initialized' not in st.session_state:
+        try:
+            # Load environment variables
+            load_dotenv()
+
+            # Initialize configuration
+            config = AppConfig()
+
+            # Initialize core services
+            anthropic_client = Anthropic(api_key=config.anthropic_api_key)
+
+            # Initialize core components
+            codebase = CodebaseStructure()
+            code_analyzer = CodeAnalyzer()
+
+            # Initialize embedding and storage
+            embedder = HierarchicalEmbedding(anthropic_client)
+            contextual_embedder = ContextualEmbedder()
+
+            # Initialize vector store
+            qdrant_client = QdrantClient(url=config.qdrant_url)
+            vector_store = CodebaseVectorStore(qdrant_client)
+            context_store = ContextStorage()
+
+            # Initialize query components
+            query_analyzer = QueryAnalyzer()
+            contextual_search = ContextualSearch(
+                vector_store=vector_store,
+                context_store=context_store,
+                embedder=embedder
+            )
+
+            # Store in session state
+            st.session_state.system_initialized = True
+            st.session_state.config = config
+            st.session_state.codebase = codebase
+            st.session_state.code_analyzer = code_analyzer
+            st.session_state.embedder = embedder
+            st.session_state.contextual_search = contextual_search
+            st.session_state.query_analyzer = query_analyzer
+
+            return True
+        except Exception as e:
+            st.error(f"Error initializing system: {str(e)}")
+            return False
+    return True
+
 def init_services():
     """Initialize all required services"""
     config = AppConfig()
     anthropic_client = Anthropic(api_key=config.anthropic_api_key)
 
-    # Initialize embeddings manager (singleton)
-    embeddings_manager = EmbeddingsManager(anthropic_client)
+    # Initialize core components
+    codebase = CodebaseStructure()
+    code_analyzer = CodeAnalyzer()
+
+    # Initialize embedding and storage
+    hierarchical_embedder = HierarchicalEmbedding(anthropic_client)
+    contextual_embedder = ContextualEmbedder()
+    vector_store = CodebaseVectorStore(qdrant_client=QdrantClient(url=config.qdrant_url))
+    context_store = ContextStorage()
+
+    # Initialize query components
+    query_analyzer = QueryAnalyzer()
+    contextual_search = ContextualSearch(vector_store, context_store, hierarchical_embedder)
 
     selected_model = st.session_state.get('selected_model', CLAUDE_MODELS["Claude 3.5 Sonnet"])
 
-    # Initialize services with embeddings manager
+    # Initialize services with new components
     chat_service = ChatService(
         anthropic_client,
-        embeddings_manager=embeddings_manager,
+        codebase=codebase,
+        code_analyzer=code_analyzer,
+        contextual_search=contextual_search,
+        query_analyzer=query_analyzer,
         model=selected_model,
         custom_instructions=st.session_state.get('custom_instructions', '')
     )
-    github_service = GitHubService(config.github_token, embeddings_manager=embeddings_manager)
+
+    github_service = GitHubService(
+        config.github_token,
+        codebase=codebase,
+        code_analyzer=code_analyzer,
+        hierarchical_embedder=hierarchical_embedder
+    )
 
     return config, chat_service, github_service
 
@@ -178,6 +259,10 @@ def main():
         page_icon="💬",
         layout="wide"
     )
+
+    if not initialize_system():
+        st.error("Failed to initialize system. Please check your configuration.")
+        return
 
     settings_manager = SettingsManager()
     init_session_state(settings_manager)

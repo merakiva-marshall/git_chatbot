@@ -1,14 +1,16 @@
 # src/services/repository_analyzer.py
 from typing import Dict, Optional
-from github_service import GitHubService
-from vector_store.embeddings_manager import EmbeddingsManager
+from src.github_service import GitHubService
+from src.embedding.hierarchical_embedder import HierarchicalEmbedding
 import logging
 import asyncio
 
 class RepositoryAnalyzer:
-    def __init__(self, github_service: GitHubService, embeddings_manager: Optional[EmbeddingsManager] = None):
+    def __init__(self, 
+                 github_service: GitHubService, 
+                 hierarchical_embedder: Optional[HierarchicalEmbedding] = None):
         self.github_service = github_service
-        self.embeddings_manager = embeddings_manager
+        self.embedder = hierarchical_embedder
         self.logger = logging.getLogger(__name__)
 
     async def analyze_repository(self, repo_url: str) -> Dict:
