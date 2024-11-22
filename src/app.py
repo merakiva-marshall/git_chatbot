@@ -2,26 +2,27 @@ import streamlit as st
 from anthropic import Anthropic
 import os
 from dotenv import load_dotenv
-from config import AppConfig  # Changed from src.config
-from chat_service import ChatService  # Changed from src.chat_service
 from github_service import GitHubService
-from utils.settings_manager import SettingsManager
-from utils.usage_tracker import UsageTracker
 import asyncio
-from embedding.hierarchical_embedder import HierarchicalEmbedding
-from embedding.contextual_embedder import ContextualEmbedder
-from storage.vector_store import CodebaseVectorStore
-from storage.context_store import ContextStorage
-from query.query_analyzer import QueryAnalyzer
-from query.contextual_search import ContextualSearch
-from core.codebase_structure import CodebaseStructure
-from analysis.code_analyzer import CodeAnalyzer
-import plotly.express as px
 import pandas as pd
 from datetime import datetime, timedelta
 from functools import partial
 import atexit
 from qdrant_client import QdrantClient
+from chat_service import ChatService
+from github_service import GitHubService
+from config import AppConfig
+from utils.settings_manager import SettingsManager
+from utils.usage_tracker import UsageTracker
+from query.query_analyzer import QueryAnalyzer
+from query.contextual_search import ContextualSearch
+from core.codebase_structure import CodebaseStructure
+from analysis.code_analyzer import CodeAnalyzer
+from embedding.hierarchical_embedder import HierarchicalEmbedding
+from embedding.contextual_embedder import ContextualEmbedder
+from storage.vector_store import CodebaseVectorStore
+from storage.context_store import ContextStorage
+from vector_store.qdrant_manager import QdrantManager
 
 # Load environment variables
 load_dotenv()

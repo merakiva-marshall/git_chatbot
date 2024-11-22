@@ -2,8 +2,11 @@ import os
 import sys
 from pathlib import Path
 
+# Get the absolute path to the project root directory
+project_root = Path(__file__).parent.absolute()
+src_path = project_root / "src"
+
 # Add the src directory to Python path
-src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
 # Run the Streamlit app

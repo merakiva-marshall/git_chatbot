@@ -4,10 +4,10 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
 from dataclasses import dataclass
-from ..core.components import (
+from core.components import (
     Component, ClassComponent, FunctionComponent, ModuleComponent
 )
-from ..core.codebase_structure import CodebaseStructure, FileInfo
+from core.codebase_structure import CodebaseStructure, FileInfo
 
 @dataclass
 class AnalysisResult:

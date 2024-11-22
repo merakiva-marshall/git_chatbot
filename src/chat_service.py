@@ -6,10 +6,10 @@ import time
 from utils.usage_tracker import UsageTracker
 from utils.token_counter import TokenCounter
 from uuid import uuid4
-from src.query.query_analyzer import QueryAnalyzer
-from src.query.contextual_search import ContextualSearch
-from src.core.codebase_structure import CodebaseStructure
-from src.analysis.code_analyzer import CodeAnalyzer
+from query.query_analyzer import QueryAnalyzer
+from core.codebase_structure import CodebaseStructure
+from analysis.code_analyzer import CodeAnalyzer
+from query.contextual_search import ContextualSearch
 
 MAX_TOKENS = 8192
 TEMPERATURE = 0.6

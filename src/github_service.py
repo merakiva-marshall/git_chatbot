@@ -10,9 +10,9 @@ import re
 from github.Repository import Repository
 from github.ContentFile import ContentFile
 import time
-from src.core.codebase_structure import CodebaseStructure
-from src.analysis.code_analyzer import CodeAnalyzer
-from src.embedding.hierarchical_embedder import HierarchicalEmbedding
+from core.codebase_structure import CodebaseStructure
+from analysis.code_analyzer import CodeAnalyzer
+from embedding.hierarchical_embedder import HierarchicalEmbedding
 
 class GitHubService:
     def __init__(self, 
